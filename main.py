@@ -3,18 +3,21 @@ import re
 import unicodedata
 import hashlib
 import math
+import urllib.parse
+import html
 from datetime import datetime, timezone
 import google_crc32c
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+# --- GLOBAL STATES ---
 bqml_state = {}
 quantize_state = {}
+pipeline_state = {}
+DAG_NODES = ["verify_data", "prepare", "train", "evaluate", "register", "publish"]
 
-@app.route('/', methods=['GET', 'POST'])
-def health_check():
-    return "Server is up and running!", 200
-
+# --- HELPER FUNCTIONS ---
 def parse_iso8601(dt_str):
     if type(dt_str) is not str: return False
     pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-](0[0-9]|1[0-3]):[0-5][0-9]|[+-]14:00)$'
@@ -32,412 +35,317 @@ def is_safe_int(x):
     return type(x) is int and not isinstance(x, bool) and 0 <= x <= 9007199254740991
 
 def is_safe_pos_int(x):
-    return type(x) is int and not isinstance(x, bool) and 0 < x <= 9007199254740991
+    return type(x) is int and not isinstance(x, bool) and 1 <= x <= 9007199254740991
 
 def is_finite_num(x):
     return type(x) in (int, float) and not isinstance(x, bool) and math.isfinite(x)
 
+def check_channel_rules(channel, output):
+    if channel == 'html':
+        if re.search(r'<\s*(script|iframe|object|embed)\b', output, re.IGNORECASE): return "SCRIPT_TAG"
+        if re.search(r'\bon[a-zA-Z]+\s*=', output, re.IGNORECASE): return "EVENT_HANDLER"
+    if channel == 'sql':
+        if re.search(r'[\'";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b', output, re.IGNORECASE): return "SQL_METACHAR"
+    if channel == 'shell':
+        if re.search(r'[;&|`<>]|\$\(|\$\{', output): return "SHELL_METACHAR"
+    if channel in ['html', 'markdown', 'url']:
+        if re.search(r'(javascript|data|vbscript)\s*:', output, re.IGNORECASE): return "DANGEROUS_SCHEME"
+        urls = []
+        if channel == 'html': urls = re.findall(r'(?:src|href)\s*=\s*["\']([^"\']+)["\']', output, re.IGNORECASE)
+        elif channel == 'markdown': urls = re.findall(r'\]\(([^)]+)\)', output)
+        elif channel == 'url': urls = [output.strip()]
+        allowed_hosts = {'cdn-e93c2c6.example', 'app-zttqqmn.example'}
+        for u in urls:
+            if u.startswith('//'): u = 'https:' + u
+            parsed = urllib.parse.urlparse(u)
+            if parsed.scheme and parsed.scheme.lower() not in ['http', 'https']: return "DANGEROUS_SCHEME"
+            if parsed.hostname and parsed.hostname.lower() not in allowed_hosts: return "EXTERNAL_EXFIL"
+    return "SAFE"
 
-# -----------------------------------------
-# FIXED ENDPOINT: /quantize
-# -----------------------------------------
-@app.route('/quantize', methods=['POST'], strict_slashes=False)
-def quantize():
+def canon_json(data):
+    return json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+
+def sha256_canon(data):
+    return hashlib.sha256(canon_json(data).encode('utf-8')).hexdigest()
+
+def compute_keys(inputs, cache):
+    keys = {}
+    k_vd = sha256_canon([inputs.get("generation"), inputs.get("checksum")])
+    keys["verify_data"] = k_vd
+    k_prep = sha256_canon([inputs.get("canonicalData"), inputs.get("prepareCode"), inputs.get("prepareConfig")]) if k_vd and k_vd in cache.get("verify_data", {}) else None
+    keys["prepare"] = k_prep
+    k_train = sha256_canon([cache["prepare"][k_prep]["artifactDigest"], inputs.get("trainCode"), inputs.get("trainConfig"), inputs.get("runtime")]) if k_prep and k_prep in cache.get("prepare", {}) else None
+    keys["train"] = k_train
+    k_eval = sha256_canon([cache["train"][k_train]["artifactDigest"], inputs.get("canonicalData"), inputs.get("evaluateCode"), inputs.get("evaluateConfig")]) if k_train and k_train in cache.get("train", {}) else None
+    keys["evaluate"] = k_eval
+    k_reg = sha256_canon([cache["evaluate"][k_eval]["artifactDigest"], inputs.get("schemaDigest")]) if k_eval and k_eval in cache.get("evaluate", {}) else None
+    keys["register"] = k_reg
+    k_pub = sha256_canon([cache["register"][k_reg]["artifactDigest"], inputs.get("publishConfig")]) if k_reg and k_reg in cache.get("register", {}) else None
+    keys["publish"] = k_pub
+    return keys
+
+def get_deps(node, inputs, cache, cacheKey, current_keys):
+    d = {}
+    if node == "verify_data":
+        d["generation"], d["checksum"] = inputs.get("generation"), inputs.get("checksum")
+    elif node == "prepare":
+        d["canonicalData"], d["prepareCode"], d["prepareConfig"] = inputs.get("canonicalData"), inputs.get("prepareCode"), inputs.get("prepareConfig")
+    elif node == "train":
+        p_key = current_keys.get("prepare")
+        d["prepareArtifact"] = cache["prepare"][p_key]["artifactDigest"] if p_key and p_key in cache.get("prepare", {}) else None
+        d["trainCode"], d["trainConfig"], d["runtime"] = inputs.get("trainCode"), inputs.get("trainConfig"), inputs.get("runtime")
+    elif node == "evaluate":
+        t_key = current_keys.get("train")
+        d["trainArtifact"] = cache["train"][t_key]["artifactDigest"] if t_key and t_key in cache.get("train", {}) else None
+        d["canonicalData"], d["evaluateCode"], d["evaluateConfig"] = inputs.get("canonicalData"), inputs.get("evaluateCode"), inputs.get("evaluateConfig")
+    elif node == "register":
+        e_key = current_keys.get("evaluate")
+        d["evaluateArtifact"] = cache["evaluate"][e_key]["artifactDigest"] if e_key and e_key in cache.get("evaluate", {}) else None
+        d["schemaDigest"] = inputs.get("schemaDigest")
+    elif node == "publish":
+        r_key = current_keys.get("register")
+        d["registerArtifact"] = cache["register"][r_key]["artifactDigest"] if r_key and r_key in cache.get("register", {}) else None
+        d["publishConfig"] = inputs.get("publishConfig")
+    d["cacheKey"] = cacheKey
+    return d
+
+# --- ENDPOINTS ---
+@app.route('/', methods=['GET', 'POST'])
+def health_check():
+    return "Server is up and running!", 200
+
+@app.route('/release-gate', methods=['POST'], strict_slashes=False)
+def release_gate():
+    data = request.get_json(force=True, silent=True) or {}
+    workflow, image, violations = data.get('workflow') or {}, data.get('image') or {}, []
+    if workflow.get('permissions') != {"contents": "read", "packages": "write", "id-token": "none"}: violations.append("EXCESS_PERMISSION")
+    event = data.get('event')
+    if event == "pull_request" and workflow.get('trigger') != "pull_request": violations.append("UNSAFE_PR_TRIGGER")
+    if not (workflow.get('testsPassed') is True and workflow.get('matrixComplete') is True and workflow.get('failFast') is False): violations.append("TESTS_INCOMPLETE")
+    for action in (workflow.get('actions') or []):
+        if isinstance(action, dict) and action.get('owner') != 'actions' and not re.match(r'^[a-f0-9]{40}$', str(action.get('ref', ''))):
+            violations.append("MUTABLE_ACTION"); break
+    if image.get('multiStage') is not True: violations.append("SINGLE_STAGE_IMAGE")
+    if image.get('runsAsRoot') is not False: violations.append("ROOT_RUNTIME")
+    if image.get('secretMode') not in ['none', 'buildkit']: violations.append("SECRET_IN_LAYER")
+    if image.get('criticalVulnerabilities') != 0: violations.append("CRITICAL_CVE")
+    if image.get('digestPinned') is not True: violations.append("UNPINNED_IMAGE")
+    if data.get('target') == 'production':
+        if event != 'push' or data.get('ref') != 'refs/heads/main': violations.append("INVALID_PRODUCTION_REF")
+        if workflow.get('environmentApproval') is not True: violations.append("APPROVAL_REQUIRED")
+    return jsonify({"decision": "promote" if not violations else "block", "violations": violations})
+
+@app.route('/action-firewall', methods=['POST'], strict_slashes=False)
+def action_firewall():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict) or 'action' not in data or 'provenance' not in data or 'humanApproved' not in data: return jsonify({"decision": "block", "reason": "INVALID_SCHEMA"})
+    action = data.get('action')
+    if not isinstance(action, dict) or 'tool' not in action or 'args' not in action: return jsonify({"decision": "block", "reason": "INVALID_SCHEMA"})
+    tool, args = action.get('tool'), action.get('args')
+    if not isinstance(args, dict): return jsonify({"decision": "block", "reason": "INVALID_SCHEMA"})
+    if tool not in ["search", "lookup_record", "send_email", "render_html"]: return jsonify({"decision": "block", "reason": "TOOL_NOT_ALLOWED"})
+    arg_keys = set(args.keys())
+    if tool == "search":
+        if arg_keys != {"query"} or not isinstance(args.get("query"), str) or not (1 <= len(args.get("query")) <= 200): return jsonify({"decision": "block", "reason": "INVALID_SCHEMA"})
+    elif tool == "lookup_record":
+        if arg_keys != {"tenantId", "recordId"} or not isinstance(args.get("tenantId"), str) or not isinstance(args.get("recordId"), str) or len(args.get("recordId")) == 0: return jsonify({"decision": "block", "reason": "INVALID_SCHEMA"})
+    elif tool == "send_email":
+        if arg_keys != {"to", "subject", "body"} or not all(isinstance(args.get(k), str) for k in ["to", "subject", "body"]): return jsonify({"decision": "block", "reason": "INVALID_SCHEMA"})
+    elif tool == "render_html":
+        if arg_keys != {"html"} or not isinstance(args.get("html"), str): return jsonify({"decision": "block", "reason": "INVALID_SCHEMA"})
+    if tool == "lookup_record" and args.get("tenantId") != "tenant-n5thd3i": return jsonify({"decision": "block", "reason": "TENANT_SCOPE"})
+    if tool == "send_email":
+        to_email = args.get("to", "")
+        if not to_email.endswith("@notify-idu9ogj.example") or to_email.split("@")[-1] != "notify-idu9ogj.example": return jsonify({"decision": "block", "reason": "EGRESS_DENIED"})
+    if tool == "send_email" and data.get("humanApproved") is not True: return jsonify({"decision": "block", "reason": "APPROVAL_REQUIRED"})
+    if tool == "render_html":
+        hc = args.get("html", "").lower()
+        if "<script" in hc or "<iframe" in hc or "javascript:" in hc or re.search(r'\bon[a-z]+\s*=', hc): return jsonify({"decision": "block", "reason": "UNSAFE_OUTPUT"})
+    return jsonify({"decision": "allow", "reason": "ALLOW"})
+
+@app.route('/terraform/plan', methods=['POST'], strict_slashes=False)
+def terraform_plan():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict): return jsonify({"decision": "reject", "reason": "INVALID_PLAN"})
+    env, state, prov_version, dest_appr, resource = data.get('environment'), data.get('state'), data.get('providerVersion'), data.get('destroyApproved'), data.get('resource')
+    if not (isinstance(env, str) and isinstance(state, dict) and isinstance(prov_version, str) and isinstance(dest_appr, bool) and isinstance(resource, dict)): return jsonify({"decision": "reject", "reason": "INVALID_PLAN"})
+    if not (isinstance(state.get('backend'), str) and isinstance(state.get('locked'), bool)): return jsonify({"decision": "reject", "reason": "INVALID_PLAN"})
+    r_addr, r_type, r_action, r_labels, r_secret, r_force = resource.get('address'), resource.get('type'), resource.get('action'), resource.get('labels'), resource.get('secret'), resource.get('forceDestroy')
+    if not (isinstance(r_addr, str) and isinstance(r_type, str) and isinstance(r_action, str)) or r_action not in ['create', 'update', 'delete'] or not isinstance(r_labels, dict) or not isinstance(r_force, bool) or (r_secret is not None and not isinstance(r_secret, str)): return jsonify({"decision": "reject", "reason": "INVALID_PLAN"})
+    if env != "prod-iurmc9": return jsonify({"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"})
+    if state.get('backend') not in ['gcs', 's3', 'azurerm', 'remote'] or state.get('locked') is not True: return jsonify({"decision": "reject", "reason": "STATE_UNSAFE"})
+    if not re.match(r'^(~>\s*\d+(\.\d+)*|=\s*\d+(\.\d+)*|\d+(\.\d+)*)$', prov_version.strip()): return jsonify({"decision": "reject", "reason": "UNPINNED_PROVIDER"})
+    if not all(r_labels.get(k) == v for k, v in {"owner": "student-abxhl", "environment": "production", "cost_center": "cc-47mu"}.items()): return jsonify({"decision": "reject", "reason": "MISSING_LABELS"})
+    if r_secret is not None and (not r_secret.startswith("secret://") or len(r_secret) == len("secret://")): return jsonify({"decision": "reject", "reason": "PLAINTEXT_SECRET"})
+    if r_action == 'delete' and r_type in ['storage_bucket', 'sql_database', 'persistent_disk'] and dest_appr is not True: return jsonify({"decision": "reject", "reason": "DELETE_NOT_APPROVED"})
+    if r_type == 'storage_bucket' and r_force is True: return jsonify({"decision": "reject", "reason": "FORCE_DESTROY"})
+    return jsonify({"decision": "approve", "reason": "APPROVE"})
+
+@app.route('/sanitize-output', methods=['POST'], strict_slashes=False)
+def sanitize_output():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict): return jsonify({"safe": False, "reason": "INVALID_SCHEMA"})
+    channel, output = data.get('channel'), data.get('output')
+    if channel not in ["html", "markdown", "url", "sql", "shell"] or not isinstance(output, str) or len(output) > 20000: return jsonify({"safe": False, "reason": "INVALID_SCHEMA"})
+    t1 = urllib.parse.unquote(output)
+    t2 = html.unescape(t1)
+    decoded_output = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), t2)
+    if decoded_output != output:
+        decoded_reason = check_channel_rules(channel, decoded_output)
+        if decoded_reason != "SAFE": return jsonify({"safe": False, "reason": "ENCODED_PAYLOAD"})
+    original_reason = check_channel_rules(channel, output)
+    return jsonify({"safe": original_reason == "SAFE", "reason": original_reason})
+
+@app.route('/corroborate', methods=['POST'], strict_slashes=False)
+def corroborate():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict): return jsonify({"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+    claim = data.get('claim')
+    if not isinstance(claim, dict) or not isinstance(claim.get('value'), str): return jsonify({"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+    asOf_str = data.get('asOf')
+    if not isinstance(asOf_str, str): return jsonify({"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+    try: asOf_dt = datetime.fromisoformat(asOf_str.replace('Z', '+00:00'))
+    except Exception: return jsonify({"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+    staleness_days = data.get('stalenessDays')
+    if not isinstance(staleness_days, (int, float)) or isinstance(staleness_days, bool): return jsonify({"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+    sources = data.get('sources')
+    if not isinstance(sources, list): return jsonify({"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+    claim_value = claim.get('value')
+    valid_types = {"dns", "ct_log", "registry", "archive", "scan"}
+    valid_sources = []
+    for s in sources:
+        if not isinstance(s, dict): continue
+        s_id, s_type, s_origin, s_obs, s_val, s_auth = s.get('id'), s.get('type'), s.get('origin'), s.get('observedAt'), s.get('value'), s.get('authoritative', False)
+        if not all(isinstance(x, str) for x in [s_id, s_type, s_origin, s_obs, s_val]): continue
+        if s_type not in valid_types: continue
+        try: obs_dt = datetime.fromisoformat(s_obs.replace('Z', '+00:00'))
+        except Exception: continue
+        delta_days = (asOf_dt - obs_dt).total_seconds() / 86400.0
+        is_fresh = (0 <= delta_days <= staleness_days)
+        valid_sources.append({'id': s_id, 'type': s_type, 'origin': s_origin, 'value': s_val, 'authoritative': bool(s_auth), 'is_fresh': is_fresh})
+    contradicting_ids = []
+    for s in valid_sources:
+        if s['is_fresh'] and s['authoritative'] and s['value'] != claim_value: contradicting_ids.append(s['id'])
+    if contradicting_ids:
+        contradicting_ids.sort()
+        return jsonify({"verdict": "contradicted", "confidence": "low", "corroboratingSources": contradicting_ids})
+    fresh_matching = [s for s in valid_sources if s['is_fresh'] and s['value'] == claim_value]
+    origin_map = {}
+    for s in fresh_matching:
+        org = s['origin']
+        if org not in origin_map: origin_map[org] = []
+        origin_map[org].append(s)
+    representatives = []
+    for org, group in origin_map.items():
+        group.sort(key=lambda x: x['id'])
+        representatives.append(group[0])
+    if len(representatives) >= 2:
+        types_span = {r['type'] for r in representatives}
+        confidence = "high" if len(types_span) >= 2 else "medium"
+        rep_ids = sorted([r['id'] for r in representatives])
+        return jsonify({"verdict": "supported", "confidence": confidence, "corroboratingSources": rep_ids})
+    return jsonify({"verdict": "unverified", "confidence": "low", "corroboratingSources": []})
+
+@app.route('/build-corpus', methods=['POST'], strict_slashes=False)
+def build_corpus():
     try: req = request.get_json(force=True)
     except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
-    
-    if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
-    phase = req.get("phase")
-    if phase not in ["freeze", "select"]:
-        return jsonify({"error": "INVALID_INPUT"}), 400
-        
-    if phase == "freeze":
-        cands = req.get("candidates")
-        # ONLY return 400 if candidate list is empty/non-array as strictly requested
-        if type(cands) is not list or len(cands) == 0:
-            return jsonify({"error": "INVALID_INPUT"}), 400
-            
-        fid = req.get("freezeId")
-        cal_dig = req.get("calibrationDigest")
-        tok_dig = req.get("tokenizerDigest")
-        aur = req.get("allowedUnsupportedReasons")
-        
-        if fid in quantize_state:
-            if quantize_state[fid]['request'] != req: return jsonify({"error": "FREEZE_ID_CONFLICT"}), 409
-            return jsonify(quantize_state[fid]['response'])
-            
-        out_cands = []
-        for c in cands:
-            if type(c) is not dict: continue 
-            cname = c.get("name")
-            if type(cname) is not str: continue
-            
-            codes = set()
-            files = c.get("files")
-            inv = []
-            tb = None
-            pd = None
-            
-            if type(files) is not dict or not files:
-                codes.add("INVALID_INPUT")
-            else:
-                valid_files = True
-                for fn, fcontent in files.items():
-                    if type(fn) is not str or not fn or type(fcontent) is not str:
-                        valid_files = False
-                        codes.add("INVALID_INPUT")
-                        break
-                if valid_files:
-                    tb = 0
-                    for fn, fcontent in files.items():
-                        b = fcontent.encode('utf-8')
-                        inv.append({"name": fn, "bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()})
-                    inv.sort(key=lambda x: x["name"].encode('utf-8'))
-                    for x in inv: tb += x["bytes"]
-                    inv_json = json.dumps([{"name": x["name"], "bytes": x["bytes"], "sha256": x["sha256"]} for x in inv], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-                    pd = hashlib.sha256(inv_json).hexdigest()
-                    
-            status = "frozen"
-            ureason = c.get("unsupportedReason")
-            
-            if "unsupportedReason" in c and type(ureason) is str:
-                if type(aur) is list and ureason in aur: status = "unsupported"
-                else: codes.add("UNALLOWED_UNSUPPORTED_REASON"); status = "invalid"
-            else:
-                if c.get("loadable") is not True: codes.add("NOT_LOADABLE")
-                if c.get("calibrationDigest") != cal_dig: codes.add("CALIBRATION_MISMATCH")
-                if c.get("tokenizerDigest") != tok_dig: codes.add("TOKENIZER_MISMATCH")
-                if codes: status = "invalid"
-                
-            out_cands.append({
-                "name": cname, "status": status,
-                "inventory": inv if "INVALID_INPUT" not in codes else [],
-                "totalBytes": tb, "packageDigest": pd,
-                "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
-            })
-            
-        out_cands.sort(key=lambda x: x["name"].encode('utf-8'))
-        res = {"freezeId": fid, "candidates": out_cands}
-        
-        if type(fid) is str and fid:
-            quantize_state[fid] = {"request": req, "response": res}
-            
-        return jsonify(res)
-        
-    elif phase == "select":
-        cands = req.get("candidates")
-        rows = req.get("rows")
-        policy = req.get("policy")
-        
-        # ONLY return 400 for these specific structural missing fields
-        if type(cands) is not list or type(rows) is not list or type(policy) is not dict:
-            return jsonify({"error": "INVALID_INPUT"}), 400
-            
-        fid = req.get("freezeId")
-        lats = req.get("latencies")
-        
-        is_policy_valid = True
-        mb = policy.get("maxBytes")
-        af = policy.get("aggregateFloor")
-        rs = policy.get("requiredSlices")
-        ml = policy.get("maxLatencyMs")
-        co = policy.get("candidateOrder")
-        
-        if not (is_safe_int(mb) and mb >= 0 and is_finite_num(af) and 0 <= af <= 1 and type(rs) is dict and is_finite_num(ml) and ml >= 0 and type(co) is list):
-            is_policy_valid = False
+    if type(req) is not dict or type(req.get('policy')) is not dict or type(req.get('objects')) is not list: return jsonify({"error": "INVALID_INPUT"}), 400
+    policy = req['policy']
+    min_dt, max_dt, thresh = parse_iso8601(policy.get('minTime')), parse_iso8601(policy.get('maxTime')), policy.get('contaminationThreshold')
+    policy_valid = bool(min_dt and max_dt and type(thresh) in (int, float) and not isinstance(thresh, bool) and 0 <= thresh <= 1)
+    rej_objs, rej_rows, lineage, valid_rows = [], [], [], []
+    for item in req['objects']:
+        obj, obj_codes = item if type(item) is dict else {}, set()
+        uri = obj.get('uri')
+        if type(uri) is not str or uri != "gs://bucket/object": obj_codes.add("URI_INVALID")
+        gen, f_gen = obj.get('generation'), obj.get('fetchedGeneration')
+        if not (type(gen) is str and gen.isdecimal()) or not (type(f_gen) is str and f_gen.isdecimal()): obj_codes.add("GENERATION_INVALID")
+        if gen != f_gen: obj_codes.add("GENERATION_MISMATCH")
+        crc_in = obj.get('crc32c')
+        crc_syntax_valid = type(crc_in) is str and bool(re.match(r'^[a-f0-9]{8}$', crc_in))
+        if not crc_syntax_valid: obj_codes.add("CRC32C_INVALID")
+        content = obj.get('content')
+        if type(content) is not str: obj_codes.add("SCHEMA_INVALID")
+        elif crc_syntax_valid and google_crc32c.Checksum(content.encode('utf-8')).hexdigest().decode('utf-8').lower().zfill(8) != crc_in: obj_codes.add("CRC32C_MISMATCH")
+        schema_id = obj.get('schemaId')
+        if schema_id != 'training-v1': obj_codes.add("SCHEMA_INVALID")
+        obj_rows = []
+        if type(content) is str:
+            lines = content.split('\n')
+            has_non_blank = False
+            for line in lines:
+                if not line.strip(): continue
+                has_non_blank = True
+                try: row = json.loads(line)
+                except ValueError: obj_codes.add("JSONL_INVALID"); continue
+                if type(row) is not dict or set(row.keys()) != {'id', 'entity', 'eventTime', 'revision', 'text'}: obj_codes.add("SCHEMA_INVALID"); continue
+                if type(row['id']) is not str or type(row['entity']) is not str or type(row['eventTime']) is not str or type(row['text']) is not str: obj_codes.add("SCHEMA_INVALID"); continue
+                rev = row['revision']
+                if type(rev) is not int or isinstance(rev, bool) or rev < 0 or rev > 9007199254740991: obj_codes.add("SCHEMA_INVALID"); continue
+                dt = parse_iso8601(row['eventTime'])
+                if not dt: obj_codes.add("SCHEMA_INVALID"); continue
+                r_c = {"id": row['id'], "entity": norm_str(row['entity']), "eventTime": dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] + 'Z', "revision": rev, "text": norm_str(row['text'])}
+                r_c['words'] = extract_words(r_c['text'])
+                obj_rows.append(r_c)
+            if not has_non_blank: obj_codes.add("SCHEMA_INVALID")
+        if obj_codes: rej_objs.append({"uri": uri if type(uri) is str else None, "reasonCodes": sorted(list(obj_codes), key=lambda x: x.encode('utf-8'))})
         else:
-            for k, v in rs.items():
-                if type(k) is not str or not is_finite_num(v) or not (0 <= v <= 1): is_policy_valid = False; break
-            for x in co:
-                if type(x) is not str: is_policy_valid = False; break
-            if len(set(co)) != len(co): is_policy_valid = False
-            
-        cand_names = [c.get("name") for c in cands if type(c) is dict and type(c.get("name")) is str]
-        if is_policy_valid and set(cand_names) != set(co): is_policy_valid = False
-            
-        is_frozen = type(fid) is str and fid in quantize_state
-        stored_cands = quantize_state[fid]["response"]["candidates"] if is_frozen else []
-        stored_cands_map = {c["name"]: c for c in stored_cands}
-        
-        global_lineage_ok = True
-        if is_frozen and cands != stored_cands: global_lineage_ok = False
-                
-        results, admitted_list = [], []
-        
-        for c in cands:
-            if type(c) is not dict: continue
-            cname = c.get("name")
-            if type(cname) is not str: continue
-            
-            codes = set()
-            if not is_frozen: codes.add("NOT_FROZEN")
-            if not is_policy_valid: codes.add("INVALID_POLICY")
-            
-            if is_frozen and (not global_lineage_ok or cname not in stored_cands_map or c != stored_cands_map[cname]):
-                codes.add("INVALID_LINEAGE")
-                
-            cinv = c.get("inventory")
-            if type(cinv) is list:
-                cb = 0
-                for x in cinv:
-                    if type(x) is dict and type(x.get("bytes")) is int: cb += x["bytes"]
-                c_json = json.dumps([{"name": x.get("name"), "bytes": x.get("bytes"), "sha256": x.get("sha256")} for x in cinv if type(x) is dict], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-                cpd = hashlib.sha256(c_json).hexdigest()
-                if c.get("totalBytes") != cb or c.get("packageDigest") != cpd: codes.add("INVALID_MANIFEST")
-            else:
-                codes.add("INVALID_MANIFEST")
-                
-            lat = lats.get(cname) if type(lats) is dict else None
-            valid_lat = is_finite_num(lat) and lat >= 0
-            
-            preds_valid = True
-            for r in rows:
-                if type(r) is not dict or "predictions" not in r or type(r["predictions"]) is not dict: preds_valid = False; break
-                pval = r["predictions"].get(cname)
-                if pval not in [0, 1] or r.get("label") not in [0, 1]: preds_valid = False; break
-                    
-            agg = None
-            sl_acc = None
-            
-            if not preds_valid:
-                codes.add("INVALID_PREDICTIONS")
-            else:
-                sl_acc = {}
-                if rows:
-                    agg = round(sum(1 for r in rows if r.get("label") == r["predictions"].get(cname)) / len(rows), 12)
-                    smets = {}
-                    for r in rows:
-                        sl = r.get("slice")
-                        if type(sl) is str:
-                            if sl not in smets: smets[sl] = {"c": 0, "t": 0}
-                            smets[sl]["t"] += 1
-                            if r.get("label") == r["predictions"].get(cname): smets[sl]["c"] += 1
-                    for sl, md in smets.items(): sl_acc[sl] = round(md["c"] / md["t"], 12)
-                else: agg = 0.0
-                    
-            if is_policy_valid:
-                if not valid_lat or lat > ml: codes.add("LATENCY_LIMIT")
-                tb = c.get("totalBytes")
-                if not is_safe_int(tb) or tb > mb: codes.add("SIZE_LIMIT")
-                if preds_valid:
-                    if agg < af: codes.add("AGGREGATE_FLOOR")
-                    for req_s, floor in rs.items():
-                        if req_s not in sl_acc: codes.add(f"MISSING_SLICE:{req_s}")
-                        elif sl_acc[req_s] < floor: codes.add(f"SLICE_FLOOR:{req_s}")
-                            
-            is_admitted = not codes and is_frozen and stored_cands_map.get(cname, {}).get("status") == "frozen"
-            
-            valid_tb = is_safe_int(c.get("totalBytes")) and "INVALID_MANIFEST" not in codes
-
-            res_obj = {
-                "name": cname, "aggregate": agg, "slices": sl_acc,
-                "totalBytes": c.get("totalBytes") if valid_tb else None,
-                "latencyMs": lat if valid_lat else None, "admitted": is_admitted,
-                "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
-            }
-            results.append(res_obj)
-            if is_admitted: admitted_list.append(res_obj)
-                
-        def get_order_idx(n):
-            try: return co.index(n) if type(co) is list else 999999
-            except: return 999999
-            
-        results.sort(key=lambda x: (get_order_idx(x["name"]), x["name"].encode('utf-8')))
-        admitted_list.sort(key=lambda x: (x["totalBytes"], x["latencyMs"], get_order_idx(x["name"])))
-        
-        selected = admitted_list[0]["name"] if admitted_list else None
-        pkg_manifest = stored_cands_map.get(selected) if selected and is_frozen else None
-            
-        return jsonify({
-            "freezeId": fid, "selected": selected, "results": results, "packageManifest": pkg_manifest
-        })
-
-# -----------------------------------------
-# PREVIOUS ROUTES (DO NOT REMOVE)
-# -----------------------------------------
-@app.route('/adapt', methods=['POST'], strict_slashes=False)
-def adapt():
-    try: req = request.get_json(force=True)
-    except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
-    if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
-    op = req.get("operation")
-    if op not in ["choose", "repair"]: return jsonify({"error": "INVALID_INPUT"}), 400
-    if op == "choose":
-        policy, cands = req.get("policy"), req.get("candidates")
-        if type(policy) is not dict or type(cands) is not list: return jsonify({"error": "INVALID_INPUT"}), 400
-        req_names = ["prompt_only", "retrieval", "lora", "qlora"]
-        cand_map = {}
-        for c in cands:
-            if type(c) is dict and "name" in c and type(c["name"]) is str: cand_map[c["name"]] = cand_map.get(c["name"], 0) + 1
-        for n in req_names:
-            if cand_map.get(n, 0) != 1: return jsonify({"error": "INVALID_INPUT"}), 400
-        p_mq, p_fr, p_ml, p_mm, p_le, p_mt, p_hr = policy.get("minQuality"), policy.get("freshnessRequired"), policy.get("maxLatencyMs"), policy.get("maxMemoryMb"), policy.get("maxLabeledExamples"), policy.get("maxTotalCost"), policy.get("horizonRequests")
-        if not (is_finite_num(p_mq) and 0 <= p_mq <= 1 and type(p_fr) is bool and is_finite_num(p_ml) and p_ml >= 0 and is_finite_num(p_mm) and p_mm >= 0 and is_safe_int(p_le) and is_finite_num(p_mt) and p_mt >= 0 and is_safe_int(p_hr)): return jsonify({"error": "INVALID_INPUT"}), 400
-        total_costs, reason_codes, eligible = {}, {n: set() for n in req_names}, []
-        cand_dicts = {c["name"]: c for c in cands if type(c) is dict and c.get("name") in req_names}
-        for n in req_names:
-            c = cand_dicts[n]
-            avail, qual, fresh, lat, mem, lab, otc, rc = c.get("available"), c.get("quality"), c.get("freshness"), c.get("latencyMs"), c.get("memoryMb"), c.get("labeledExamples"), c.get("oneTimeCost"), c.get("recurringCost")
-            if not (type(avail) is bool and is_finite_num(qual) and 0 <= qual <= 1 and type(fresh) is bool and is_finite_num(lat) and lat >= 0 and is_finite_num(mem) and mem >= 0 and is_safe_int(lab) and is_finite_num(otc) and otc >= 0 and is_finite_num(rc) and rc >= 0):
-                reason_codes[n].add("INVALID_INPUT"); total_costs[n] = 0.0; continue
-            cost = round(otc + p_hr * rc, 12)
-            total_costs[n] = cost
-            if not avail: reason_codes[n].add("UNAVAILABLE")
-            if qual < p_mq: reason_codes[n].add("QUALITY_FLOOR")
-            if p_fr and not fresh: reason_codes[n].add("FRESHNESS_REQUIRED")
-            if lat > p_ml: reason_codes[n].add("LATENCY_LIMIT")
-            if mem > p_mm: reason_codes[n].add("MEMORY_LIMIT")
-            if lab > p_le: reason_codes[n].add("DATA_LIMIT")
-            if cost > p_mt: reason_codes[n].add("COST_LIMIT")
-            if not reason_codes[n]: eligible.append(n)
-        return jsonify({"selected": eligible[0] if eligible else None, "eligible": eligible, "totalCosts": total_costs, "reasonCodes": {n: sorted(list(reason_codes[n]), key=lambda x: x.encode('utf-8')) for n in req_names}})
-    if op == "repair":
-        reason_codes, toks, tok_valid, labels = set(), req.get("tokens"), True, []
-        if type(toks) is not list or not toks: tok_valid = False; reason_codes.add("INVALID_TOKEN")
+            lineage.append({"uri": uri, "generation": gen, "crc32c": crc_in, "schemaId": schema_id})
+            valid_rows.extend(obj_rows)
+    dedup = {}
+    for r in valid_rows:
+        key = (r['entity'], r['eventTime'], r['text'])
+        if key not in dedup: dedup[key] = r
         else:
-            for t in toks:
-                if type(t) is not dict or not is_safe_int(t.get("id")) or t.get("role") not in ["system", "user", "assistant"] or type(t.get("padding")) is not bool or type(t.get("text")) is not str: tok_valid = False; break
-            if not tok_valid: reason_codes.add("INVALID_TOKEN"); labels = [-100] * len(toks) if type(toks) is list else []
-            else:
-                for t in toks: labels.append(t["id"] if t["role"] == "assistant" and t["padding"] is False else -100)
-        t_pass = True
-        if req.get("templateApplications") != 1: t_pass = False; reason_codes.add("CHAT_TEMPLATE_COUNT")
-        params, allowed_t, peft_pass, trainable, trainable_count = req.get("parameters"), req.get("allowedTargets"), True, [], 0
-        if type(params) is not list or type(allowed_t) is not list or not allowed_t: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
-        else:
-            tgt_set, tgt_valid = set(), True
-            for at in allowed_t:
-                if type(at) is not str or not at or at in tgt_set: tgt_valid = False; break
-                tgt_set.add(at)
-            p_names, p_valid = set(), True
-            for p in params:
-                if type(p) is not dict or type(p.get("name")) is not str or type(p.get("target")) is not str or not is_safe_pos_int(p.get("numel")) or p.get("name") in p_names: p_valid = False; break
-                p_names.add(p.get("name"))
-            if not tgt_valid or not p_valid: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
-            else:
-                for p in params:
-                    if p.get("target") in tgt_set and (p.get("name").endswith(".lora_A.weight") or p.get("name").endswith(".lora_B.weight")):
-                        trainable.append(p.get("name")); trainable_count += p.get("numel")
-                if not trainable: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
-                else: trainable.sort(key=lambda x: x.encode('utf-8'))
-        if req.get("inferenceMode") is not False: reason_codes.add("INFERENCE_MODE")
-        if req.get("dropoutActiveDuringEval") is not False: reason_codes.add("EVAL_DROPOUT_ACTIVE")
-        t_rows, e_rows = req.get("trainRowIds"), req.get("evalRowIds")
-        if type(t_rows) is not list or type(e_rows) is not list or not t_rows or not e_rows: reason_codes.add("EVAL_LEAKAGE")
-        else:
-            t_set, t_ok, e_set, e_ok = set(), True, set(), True
-            for r in t_rows:
-                if type(r) is not str or not r or r in t_set: t_ok = False; break
-                t_set.add(r)
-            for r in e_rows:
-                if type(r) is not str or not r or r in e_set: e_ok = False; break
-                e_set.add(r)
-            if not t_ok or not e_ok or not t_set.isdisjoint(e_set): reason_codes.add("EVAL_LEAKAGE")
-        af, adapter_files = req.get("artifactFiles"), []
-        if type(af) is not list: reason_codes.add("ADAPTER_FILE_SET")
-        else:
-            if "pytorch_model.bin" in af or "model.safetensors" in af: reason_codes.add("FULL_MODEL_ARTIFACT")
-            elif set(af) != {"adapter_config.json", "adapter_model.safetensors"} or len(af) != 2: reason_codes.add("ADAPTER_FILE_SET")
-            else: adapter_files = sorted(af, key=lambda x: x.encode('utf-8'))
-        br, dd, cd, cfd, ed = req.get("baseRevision"), req.get("datasetDigest"), req.get("codeDigest"), req.get("configDigest"), req.get("expectedDigests")
-        if type(br) is not str or not re.match(r'^[a-f0-9]{40}$', br): reason_codes.add("MUTABLE_BASE_REVISION")
-        if (type(ed) is not dict or type(dd) is not str or not re.match(r'^[a-f0-9]{64}$', dd) or dd != ed.get("dataset") or type(cd) is not str or not re.match(r'^[a-f0-9]{64}$', cd) or cd != ed.get("code") or type(cfd) is not str or not re.match(r'^[a-f0-9]{64}$', cfd) or cfd != ed.get("config")): reason_codes.add("LINEAGE_MISMATCH")
-        mb, ga, rep, eeb = req.get("microBatch"), req.get("gradientAccumulation"), req.get("replicas"), req.get("expectedEffectiveBatch")
-        if not (is_safe_pos_int(mb) and is_safe_pos_int(ga) and is_safe_pos_int(rep) and is_safe_pos_int(eeb) and mb * ga * rep == eeb): reason_codes.add("EFFECTIVE_BATCH_MISMATCH")
-        chk = req.get("checkpoint")
-        if type(chk) is not dict or set(chk.keys()) != {"model", "optimizer", "scheduler", "step", "rng", "dataPosition"}: reason_codes.add("INCOMPLETE_CHECKPOINT")
-        uw, rw, rt = req.get("uninterruptedWeights"), req.get("resumedWeights"), req.get("resumeTolerance")
-        if (type(uw) is not list or not uw or type(rw) is not list or not rw or len(uw) != len(rw) or not is_finite_num(rt) or rt < 0): reason_codes.add("RESUME_DIVERGENCE")
-        else:
-            w_ok = True
-            for u, r in zip(uw, rw):
-                if not is_finite_num(u) or not is_finite_num(r) or abs(u - r) > rt: w_ok = False; break
-            if not w_ok: reason_codes.add("RESUME_DIVERGENCE")
-        return jsonify({"labels": labels, "templatePass": t_pass, "trainableParams": trainable, "trainableCount": trainable_count, "peftConfigPass": peft_pass, "adapterFiles": adapter_files, "checkpointComplete": "INCOMPLETE_CHECKPOINT" not in reason_codes, "lineagePass": "MUTABLE_BASE_REVISION" not in reason_codes and "LINEAGE_MISMATCH" not in reason_codes, "evalIsolated": "EVAL_LEAKAGE" not in reason_codes, "evaluationDeterministic": "INFERENCE_MODE" not in reason_codes and "EVAL_DROPOUT_ACTIVE" not in reason_codes, "resumePass": "RESUME_DIVERGENCE" not in reason_codes, "reasonCodes": sorted(list(reason_codes), key=lambda x: x.encode('utf-8'))})
-
-@app.route('/promote', methods=['POST'], strict_slashes=False)
-def promote():
-    try: req = request.get_json(force=True)
-    except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
-    if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
-    policy, versions, champ_ver = req.get("policy"), req.get("versions"), req.get("championVersion")
-    if type(policy) is not dict or type(versions) is not list or type(champ_ver) is not str: return jsonify({"error": "INVALID_INPUT"}), 400
-    dt_asof = parse_iso8601(req.get("asOf"))
-    is_policy_valid = True
-    if type(policy.get("datasetDigest")) is not str or not policy.get("datasetDigest"): is_policy_valid = False
-    if type(policy.get("schemaDigest")) is not str or not policy.get("schemaDigest"): is_policy_valid = False
-    if type(policy.get("maxAgeSeconds")) is not int or isinstance(policy.get("maxAgeSeconds"), bool) or policy.get("maxAgeSeconds") < 0: is_policy_valid = False
-    if type(policy.get("maxSizeBytes")) is not int or isinstance(policy.get("maxSizeBytes"), bool) or policy.get("maxSizeBytes") < 0: is_policy_valid = False
-    acc_floor = policy.get("accuracyFloor")
-    if type(acc_floor) not in (int, float) or isinstance(acc_floor, bool) or not math.isfinite(acc_floor) or not (0 <= acc_floor <= 1): is_policy_valid = False
-    lat_max = policy.get("maxLatencyMs")
-    if type(lat_max) not in (int, float) or isinstance(lat_max, bool) or not math.isfinite(lat_max) or lat_max < 0: is_policy_valid = False
-    min_imp = policy.get("minImprovement")
-    if type(min_imp) not in (int, float) or isinstance(min_imp, bool) or not math.isfinite(min_imp) or not (0 <= min_imp <= 1): is_policy_valid = False
-    req_slices = policy.get("requiredSlices")
-    if type(req_slices) is not dict: is_policy_valid = False
-    else:
-        for k, v in req_slices.items():
-            if type(k) is not str or type(v) not in (int, float) or isinstance(v, bool) or not math.isfinite(v) or not (0 <= v <= 1): is_policy_valid = False
-    v_counts = {}
-    for v in versions:
-        if type(v) is dict and type(v.get("version")) is str: v_counts[v["version"]] = v_counts.get(v["version"], 0) + 1
-    failed_gates, eligible = {}, []
-    for v in versions:
-        if type(v) is not dict: continue
-        vid = v.get("version")
-        vid_str = str(vid) if type(vid) is not str else vid
-        if vid_str not in failed_gates: failed_gates[vid_str] = set()
-        codes = failed_gates[vid_str]
-        is_canonical = type(vid) is str and bool(re.match(r'^[1-9]\d*$', vid)) and int(vid) <= 9007199254740991
-        if not is_canonical: codes.add("INVALID_VERSION")
-        if type(vid) is str and v_counts.get(vid, 0) > 1: codes.add("DUPLICATE_VERSION")
-        if not is_policy_valid: codes.add("INVALID_POLICY")
-        eval_obj = v.get("evaluation")
-        if type(eval_obj) is not dict: codes.add("MISSING_EVALUATION")
-        else:
-            c_at = eval_obj.get("createdAt")
-            dt_cat = parse_iso8601(c_at)
-            if not dt_cat or not dt_asof: codes.add("INVALID_TIMESTAMP")
-            else:
-                delta = (dt_asof - dt_cat).total_seconds()
-                if delta < 0: codes.add("FUTURE_EVALUATION")
-                elif is_policy_valid and delta > policy.get("maxAgeSeconds", 0): codes.add("STALE_EVALUATION")
-            if eval_obj.get("artifactDigest") != v.get("artifactDigest"): codes.add("ARTIFACT_MISMATCH")
-            if is_policy_valid:
-                if eval_obj.get("datasetDigest") != policy.get("datasetDigest"): codes.add("DATASET_MISMATCH")
-                if eval_obj.get("schemaDigest") != policy.get("schemaDigest"): codes.add("SCHEMA_MISMATCH")
-            acc, lat, sz = eval_obj.get("accuracy"), eval_obj.get("latencyMs"), eval_obj.get("sizeBytes")
-            if not is_finite_num(acc) or not is_finite_num(lat) or not is_finite_num(sz): codes.add("NON_FINITE")
-            else:
-                if not (0 <= acc <= 1) or lat < 0 or sz < 0 or type(sz) is not int or isinstance(sz, bool): codes.add("METRIC_RANGE")
-                elif is_policy_valid:
-                    if acc < policy.get("accuracyFloor", 0): codes.add("ACCURACY_FLOOR")
-                    if lat > policy.get("maxLatencyMs", 0): codes.add("LATENCY_LIMIT")
-                    if sz > policy.get("maxSizeBytes", 0): codes.add("SIZE_LIMIT")
-            eval_slices = eval_obj.get("slices")
-            if is_policy_valid:
-                if type(eval_slices) is not dict:
-                    for req_s in req_slices.keys(): codes.add(f"MISSING_SLICE:{req_s}")
-                else:
-                    for req_s, floor in req_slices.items():
-                        if req_s not in eval_slices: codes.add(f"MISSING_SLICE:{req_s}")
-                        else:
-                            s_val = eval_slices[req_s]
-                            if not is_finite_num(s_val) or not (0 <= s_val <= 1): codes.add(f"SLICE_RANGE:{req_s}")
-                            elif s_val < floor: codes.add(f"SLICE_FLOOR:{req_s}")
-        if not codes and is_canonical: eligible.append(v)
-    eligible.sort(key=lambda x: (-x['evaluation']['accuracy'], x['evaluation']['latencyMs'], x['evaluation']['sizeBytes'], int(x['version'])))
-    champ_v = next((v for v in eligible if v['version'] == champ_ver), None)
-    if not champ_v: action, sel_ver, evidence, alias_mut = "block", None, None, None
-    else:
-        challenger = eligible[0]
-        if challenger['version'] == champ_ver: action, sel_ver, alias_mut, evidence = "retain", champ_ver, None, champ_v['evaluation']
-        else:
-            diff = round(challenger['evaluation']['accuracy'] - champ_v['evaluation']['accuracy'], 12)
-            if diff >= min_imp: action, sel_ver, alias_mut, evidence = "promote", challenger['version'], {"alias": "champion", "version": challenger['version']}, challenger['evaluation']
-            else: action, sel_ver, alias_mut, evidence = "retain", champ_ver, None, champ_v['evaluation']
-    return jsonify({"action": action, "championVersion": champ_ver, "selectedVersion": sel_ver, "eligibleVersions": [v['version'] for v in eligible], "failedGates": {k: sorted(list(v_set), key=lambda x: x.encode('utf-8')) for k, v_set in failed_gates.items()}, "aliasMutation": alias_mut, "evidence": evidence})
+            exist = dedup[key]
+            r_id_bytes, exist_id_bytes = r['id'].encode('utf-8'), exist['id'].encode('utf-8')
+            if r['revision'] > exist['revision'] or (r['revision'] == exist['revision'] and r_id_bytes < exist_id_bytes):
+                rej_rows.append({"id": exist['id'], "reasonCodes": ["DUPLICATE"]})
+                dedup[key] = r
+            else: rej_rows.append({"id": r['id'], "reasonCodes": ["DUPLICATE"]})
+    splits = {"train": [], "validation": [], "test": []}
+    train_words_list = []
+    for r in dedup.values():
+        if not policy_valid: rej_rows.append({"id": r['id'], "reasonCodes": ["POLICY_INVALID"]}); continue
+        r_dt = datetime.fromisoformat(r['eventTime'].replace('Z', '+00:00'))
+        if not (min_dt <= r_dt <= max_dt): rej_rows.append({"id": r['id'], "reasonCodes": ["OUT_OF_WINDOW"]}); continue
+        bucket = hashlib.sha256(r['entity'].encode('utf-8')).digest()[0] % 10
+        if bucket <= 5: splits['train'].append(r); train_words_list.append(r['words'])
+        elif bucket <= 7: splits['validation'].append(r)
+        else: splits['test'].append(r)
+    for s_name in ['validation', 'test']:
+        clean = []
+        for r in splits[s_name]:
+            contaminated = False
+            if train_words_list:
+                s1 = r['words']
+                for tw in train_words_list:
+                    sim = 1.0 if not s1 and not tw else (0.0 if not s1 or not tw else len(s1 & tw) / float(len(s1 | tw)))
+                    if sim >= thresh: contaminated = True; break
+            if contaminated: rej_rows.append({"id": r['id'], "reasonCodes": ["TRAIN_CONTAMINATION"]})
+            else: clean.append(r)
+        splits[s_name] = clean
+    digests, final_splits = {}, {}
+    def dict_sort_key(x):
+        u = x.get('uri') if 'uri' in x else x.get('id')
+        k1 = u.encode('utf-8') if type(u) is str else b''
+        k2 = json.dumps(x, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        return (k1, k2)
+    for s_name in ['train', 'validation', 'test']:
+        splits[s_name].sort(key=lambda x: (x['id'].encode('utf-8'), json.dumps({"id": x['id'], "entity": x['entity'], "eventTime": x['eventTime'], "revision": x['revision'], "text": x['text']}, separators=(',', ':'), ensure_ascii=False).encode('utf-8')))
+        ordered_lines, final_list = [], []
+        for r in splits[s_name]:
+            ordered = {"id": r['id'], "entity": r['entity'], "eventTime": r['eventTime'], "revision": r['revision'], "text": r['text']}
+            final_list.append(ordered)
+            ordered_lines.append(json.dumps(ordered, separators=(',', ':'), ensure_ascii=False))
+        out_bytes = "".join(l + "\n" for l in ordered_lines).encode('utf-8') if ordered_lines else b""
+        digests[s_name] = hashlib.sha256(out_bytes).hexdigest()
+        final_splits[s_name] = final_list
+    for row in rej_rows:
+        if 'reasonCodes' in row: row['reasonCodes'] = sorted(list(set(row['reasonCodes'])), key=lambda x: x.encode('utf-8'))
+    rej_objs.sort(key=dict_sort_key); rej_rows.sort(key=dict_sort_key); lineage.sort(key=dict_sort_key)
+    return jsonify({"splits": final_splits, "rejectedObjects": rej_objs, "rejectedRows": rej_rows, "digests": digests, "lineage": lineage})
 
 @app.route('/bqml', methods=['POST'], strict_slashes=False)
 def bqml():
@@ -554,106 +462,404 @@ def bqml():
         if "INVALID_INPUT" not in reasonCodes and b_proc > m_bytes: reasonCodes.add("BYTE_LIMIT")
         return jsonify({"runId": runId if type(runId) is str else None, "selectedTrialId": s_trial if type(s_trial) is int and not isinstance(s_trial, bool) else None, "datasetDigest": d_digest if type(d_digest) is str else None, "testMetric": test_metric, "criticalSlicePass": c_pass, "decision": "reject" if reasonCodes else "admit", "bytesProcessed": b_proc if type(b_proc) is int and not isinstance(b_proc, bool) else None, "reasonCodes": sorted(list(reasonCodes), key=lambda x: x.encode('utf-8'))})
 
-@app.route('/build-corpus', methods=['POST'], strict_slashes=False)
-def build_corpus():
+@app.route('/promote', methods=['POST'], strict_slashes=False)
+def promote():
     try: req = request.get_json(force=True)
     except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
-    if type(req) is not dict or type(req.get('policy')) is not dict or type(req.get('objects')) is not list: return jsonify({"error": "INVALID_INPUT"}), 400
-    policy = req['policy']
-    min_dt, max_dt, thresh = parse_iso8601(policy.get('minTime')), parse_iso8601(policy.get('maxTime')), policy.get('contaminationThreshold')
-    policy_valid = bool(min_dt and max_dt and type(thresh) in (int, float) and not isinstance(thresh, bool) and 0 <= thresh <= 1)
-    rej_objs, rej_rows, lineage, valid_rows = [], [], [], []
-    for item in req['objects']:
-        obj, obj_codes = item if type(item) is dict else {}, set()
-        uri = obj.get('uri')
-        if type(uri) is not str or uri != "gs://bucket/object": obj_codes.add("URI_INVALID")
-        gen, f_gen = obj.get('generation'), obj.get('fetchedGeneration')
-        if not (type(gen) is str and gen.isdecimal()) or not (type(f_gen) is str and f_gen.isdecimal()): obj_codes.add("GENERATION_INVALID")
-        if gen != f_gen: obj_codes.add("GENERATION_MISMATCH")
-        crc_in = obj.get('crc32c')
-        crc_syntax_valid = type(crc_in) is str and bool(re.match(r'^[a-f0-9]{8}$', crc_in))
-        if not crc_syntax_valid: obj_codes.add("CRC32C_INVALID")
-        content = obj.get('content')
-        if type(content) is not str: obj_codes.add("SCHEMA_INVALID")
-        elif crc_syntax_valid and google_crc32c.Checksum(content.encode('utf-8')).hexdigest().decode('utf-8').lower().zfill(8) != crc_in: obj_codes.add("CRC32C_MISMATCH")
-        schema_id = obj.get('schemaId')
-        if schema_id != 'training-v1': obj_codes.add("SCHEMA_INVALID")
-        obj_rows = []
-        if type(content) is str:
-            lines = content.split('\n')
-            has_non_blank = False
-            for line in lines:
-                if not line.strip(): continue
-                has_non_blank = True
-                try: row = json.loads(line)
-                except ValueError: obj_codes.add("JSONL_INVALID"); continue
-                if type(row) is not dict or set(row.keys()) != {'id', 'entity', 'eventTime', 'revision', 'text'}: obj_codes.add("SCHEMA_INVALID"); continue
-                if type(row['id']) is not str or type(row['entity']) is not str or type(row['eventTime']) is not str or type(row['text']) is not str: obj_codes.add("SCHEMA_INVALID"); continue
-                rev = row['revision']
-                if type(rev) is not int or isinstance(rev, bool) or rev < 0 or rev > 9007199254740991: obj_codes.add("SCHEMA_INVALID"); continue
-                dt = parse_iso8601(row['eventTime'])
-                if not dt: obj_codes.add("SCHEMA_INVALID"); continue
-                r_c = {"id": row['id'], "entity": norm_str(row['entity']), "eventTime": dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] + 'Z', "revision": rev, "text": norm_str(row['text'])}
-                r_c['words'] = extract_words(r_c['text'])
-                obj_rows.append(r_c)
-            if not has_non_blank: obj_codes.add("SCHEMA_INVALID")
-        if obj_codes: rej_objs.append({"uri": uri if type(uri) is str else None, "reasonCodes": sorted(list(obj_codes), key=lambda x: x.encode('utf-8'))})
+    if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
+    policy, versions, champ_ver = req.get("policy"), req.get("versions"), req.get("championVersion")
+    if type(policy) is not dict or type(versions) is not list or type(champ_ver) is not str: return jsonify({"error": "INVALID_INPUT"}), 400
+    dt_asof = parse_iso8601(req.get("asOf"))
+    is_policy_valid = True
+    if type(policy.get("datasetDigest")) is not str or not policy.get("datasetDigest"): is_policy_valid = False
+    if type(policy.get("schemaDigest")) is not str or not policy.get("schemaDigest"): is_policy_valid = False
+    if type(policy.get("maxAgeSeconds")) is not int or isinstance(policy.get("maxAgeSeconds"), bool) or policy.get("maxAgeSeconds") < 0: is_policy_valid = False
+    if type(policy.get("maxSizeBytes")) is not int or isinstance(policy.get("maxSizeBytes"), bool) or policy.get("maxSizeBytes") < 0: is_policy_valid = False
+    acc_floor = policy.get("accuracyFloor")
+    if type(acc_floor) not in (int, float) or isinstance(acc_floor, bool) or not math.isfinite(acc_floor) or not (0 <= acc_floor <= 1): is_policy_valid = False
+    lat_max = policy.get("maxLatencyMs")
+    if type(lat_max) not in (int, float) or isinstance(lat_max, bool) or not math.isfinite(lat_max) or lat_max < 0: is_policy_valid = False
+    min_imp = policy.get("minImprovement")
+    if type(min_imp) not in (int, float) or isinstance(min_imp, bool) or not math.isfinite(min_imp) or not (0 <= min_imp <= 1): is_policy_valid = False
+    req_slices = policy.get("requiredSlices")
+    if type(req_slices) is not dict: is_policy_valid = False
+    else:
+        for k, v in req_slices.items():
+            if type(k) is not str or type(v) not in (int, float) or isinstance(v, bool) or not math.isfinite(v) or not (0 <= v <= 1): is_policy_valid = False
+    v_counts = {}
+    for v in versions:
+        if type(v) is dict and type(v.get("version")) is str: v_counts[v["version"]] = v_counts.get(v["version"], 0) + 1
+    failed_gates, eligible = {}, []
+    for v in versions:
+        if type(v) is not dict: continue
+        vid = v.get("version")
+        vid_str = str(vid) if type(vid) is not str else vid
+        if vid_str not in failed_gates: failed_gates[vid_str] = set()
+        codes = failed_gates[vid_str]
+        is_canonical = type(vid) is str and bool(re.match(r'^[1-9]\d*$', vid)) and int(vid) <= 9007199254740991
+        if not is_canonical: codes.add("INVALID_VERSION")
+        if type(vid) is str and v_counts.get(vid, 0) > 1: codes.add("DUPLICATE_VERSION")
+        if not is_policy_valid: codes.add("INVALID_POLICY")
+        eval_obj = v.get("evaluation")
+        if type(eval_obj) is not dict: codes.add("MISSING_EVALUATION")
         else:
-            lineage.append({"uri": uri, "generation": gen, "crc32c": crc_in, "schemaId": schema_id})
-            valid_rows.extend(obj_rows)
-    dedup = {}
-    for r in valid_rows:
-        key = (r['entity'], r['eventTime'], r['text'])
-        if key not in dedup: dedup[key] = r
+            c_at = eval_obj.get("createdAt")
+            dt_cat = parse_iso8601(c_at)
+            if not dt_cat or not dt_asof: codes.add("INVALID_TIMESTAMP")
+            else:
+                delta = (dt_asof - dt_cat).total_seconds()
+                if delta < 0: codes.add("FUTURE_EVALUATION")
+                elif is_policy_valid and delta > policy.get("maxAgeSeconds", 0): codes.add("STALE_EVALUATION")
+            if eval_obj.get("artifactDigest") != v.get("artifactDigest"): codes.add("ARTIFACT_MISMATCH")
+            if is_policy_valid:
+                if eval_obj.get("datasetDigest") != policy.get("datasetDigest"): codes.add("DATASET_MISMATCH")
+                if eval_obj.get("schemaDigest") != policy.get("schemaDigest"): codes.add("SCHEMA_MISMATCH")
+            acc, lat, sz = eval_obj.get("accuracy"), eval_obj.get("latencyMs"), eval_obj.get("sizeBytes")
+            if not is_finite_num(acc) or not is_finite_num(lat) or not is_finite_num(sz): codes.add("NON_FINITE")
+            else:
+                if not (0 <= acc <= 1) or lat < 0 or sz < 0 or type(sz) is not int or isinstance(sz, bool): codes.add("METRIC_RANGE")
+                elif is_policy_valid:
+                    if acc < policy.get("accuracyFloor", 0): codes.add("ACCURACY_FLOOR")
+                    if lat > policy.get("maxLatencyMs", 0): codes.add("LATENCY_LIMIT")
+                    if sz > policy.get("maxSizeBytes", 0): codes.add("SIZE_LIMIT")
+            eval_slices = eval_obj.get("slices")
+            if is_policy_valid:
+                if type(eval_slices) is not dict:
+                    for req_s in req_slices.keys(): codes.add(f"MISSING_SLICE:{req_s}")
+                else:
+                    for req_s, floor in req_slices.items():
+                        if req_s not in eval_slices: codes.add(f"MISSING_SLICE:{req_s}")
+                        else:
+                            s_val = eval_slices[req_s]
+                            if not is_finite_num(s_val) or not (0 <= s_val <= 1): codes.add(f"SLICE_RANGE:{req_s}")
+                            elif s_val < floor: codes.add(f"SLICE_FLOOR:{req_s}")
+        if not codes and is_canonical: eligible.append(v)
+    eligible.sort(key=lambda x: (-x['evaluation']['accuracy'], x['evaluation']['latencyMs'], x['evaluation']['sizeBytes'], int(x['version'])))
+    champ_v = next((v for v in eligible if v['version'] == champ_ver), None)
+    if not champ_v: action, sel_ver, evidence, alias_mut = "block", None, None, None
+    else:
+        challenger = eligible[0]
+        if challenger['version'] == champ_ver: action, sel_ver, alias_mut, evidence = "retain", champ_ver, None, champ_v['evaluation']
         else:
-            exist = dedup[key]
-            r_id_bytes, exist_id_bytes = r['id'].encode('utf-8'), exist['id'].encode('utf-8')
-            if r['revision'] > exist['revision'] or (r['revision'] == exist['revision'] and r_id_bytes < exist_id_bytes):
-                rej_rows.append({"id": exist['id'], "reasonCodes": ["DUPLICATE"]})
-                dedup[key] = r
-            else: rej_rows.append({"id": r['id'], "reasonCodes": ["DUPLICATE"]})
-    splits = {"train": [], "validation": [], "test": []}
-    train_words_list = []
-    for r in dedup.values():
-        if not policy_valid: rej_rows.append({"id": r['id'], "reasonCodes": ["POLICY_INVALID"]}); continue
-        r_dt = datetime.fromisoformat(r['eventTime'].replace('Z', '+00:00'))
-        if not (min_dt <= r_dt <= max_dt): rej_rows.append({"id": r['id'], "reasonCodes": ["OUT_OF_WINDOW"]}); continue
-        bucket = hashlib.sha256(r['entity'].encode('utf-8')).digest()[0] % 10
-        if bucket <= 5: splits['train'].append(r); train_words_list.append(r['words'])
-        elif bucket <= 7: splits['validation'].append(r)
-        else: splits['test'].append(r)
-    for s_name in ['validation', 'test']:
-        clean = []
-        for r in splits[s_name]:
-            contaminated = False
-            if train_words_list:
-                s1 = r['words']
-                for tw in train_words_list:
-                    sim = 1.0 if not s1 and not tw else (0.0 if not s1 or not tw else len(s1 & tw) / float(len(s1 | tw)))
-                    if sim >= thresh: contaminated = True; break
-            if contaminated: rej_rows.append({"id": r['id'], "reasonCodes": ["TRAIN_CONTAMINATION"]})
-            else: clean.append(r)
-        splits[s_name] = clean
-    digests, final_splits = {}, {}
-    def dict_sort_key(x):
-        u = x.get('uri') if 'uri' in x else x.get('id')
-        k1 = u.encode('utf-8') if type(u) is str else b''
-        k2 = json.dumps(x, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-        return (k1, k2)
-    for s_name in ['train', 'validation', 'test']:
-        splits[s_name].sort(key=lambda x: (x['id'].encode('utf-8'), json.dumps({"id": x['id'], "entity": x['entity'], "eventTime": x['eventTime'], "revision": x['revision'], "text": x['text']}, separators=(',', ':'), ensure_ascii=False).encode('utf-8')))
-        ordered_lines, final_list = [], []
-        for r in splits[s_name]:
-            ordered = {"id": r['id'], "entity": r['entity'], "eventTime": r['eventTime'], "revision": r['revision'], "text": r['text']}
-            final_list.append(ordered)
-            ordered_lines.append(json.dumps(ordered, separators=(',', ':'), ensure_ascii=False))
-        out_bytes = "".join(l + "\n" for l in ordered_lines).encode('utf-8') if ordered_lines else b""
-        digests[s_name] = hashlib.sha256(out_bytes).hexdigest()
-        final_splits[s_name] = final_list
-    for row in rej_rows:
-        if 'reasonCodes' in row: row['reasonCodes'] = sorted(list(set(row['reasonCodes'])), key=lambda x: x.encode('utf-8'))
-    rej_objs.sort(key=dict_sort_key); rej_rows.sort(key=dict_sort_key); lineage.sort(key=dict_sort_key)
-    return jsonify({"splits": final_splits, "rejectedObjects": rej_objs, "rejectedRows": rej_rows, "digests": digests, "lineage": lineage})
+            diff = round(challenger['evaluation']['accuracy'] - champ_v['evaluation']['accuracy'], 12)
+            if diff >= min_imp: action, sel_ver, alias_mut, evidence = "promote", challenger['version'], {"alias": "champion", "version": challenger['version']}, challenger['evaluation']
+            else: action, sel_ver, alias_mut, evidence = "retain", champ_ver, None, champ_v['evaluation']
+    return jsonify({"action": action, "championVersion": champ_ver, "selectedVersion": sel_ver, "eligibleVersions": [v['version'] for v in eligible], "failedGates": {k: sorted(list(v_set), key=lambda x: x.encode('utf-8')) for k, v_set in failed_gates.items()}, "aliasMutation": alias_mut, "evidence": evidence})
+
+@app.route('/adapt', methods=['POST'], strict_slashes=False)
+def adapt():
+    try: req = request.get_json(force=True)
+    except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
+    if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
+    op = req.get("operation")
+    if op not in ["choose", "repair"]: return jsonify({"error": "INVALID_INPUT"}), 400
+    if op == "choose":
+        policy, cands = req.get("policy"), req.get("candidates")
+        if type(policy) is not dict or type(cands) is not list: return jsonify({"error": "INVALID_INPUT"}), 400
+        req_names = ["prompt_only", "retrieval", "lora", "qlora"]
+        cand_map = {}
+        for c in cands:
+            if type(c) is dict and "name" in c and type(c["name"]) is str: cand_map[c["name"]] = cand_map.get(c["name"], 0) + 1
+        for n in req_names:
+            if cand_map.get(n, 0) != 1: return jsonify({"error": "INVALID_INPUT"}), 400
+        p_mq, p_fr, p_ml, p_mm, p_le, p_mt, p_hr = policy.get("minQuality"), policy.get("freshnessRequired"), policy.get("maxLatencyMs"), policy.get("maxMemoryMb"), policy.get("maxLabeledExamples"), policy.get("maxTotalCost"), policy.get("horizonRequests")
+        if not (is_finite_num(p_mq) and 0 <= p_mq <= 1 and type(p_fr) is bool and is_finite_num(p_ml) and p_ml >= 0 and is_finite_num(p_mm) and p_mm >= 0 and is_safe_int(p_le) and is_finite_num(p_mt) and p_mt >= 0 and is_safe_int(p_hr)): return jsonify({"error": "INVALID_INPUT"}), 400
+        total_costs, reason_codes, eligible = {}, {n: set() for n in req_names}, []
+        cand_dicts = {c["name"]: c for c in cands if type(c) is dict and c.get("name") in req_names}
+        for n in req_names:
+            c = cand_dicts[n]
+            avail, qual, fresh, lat, mem, lab, otc, rc = c.get("available"), c.get("quality"), c.get("freshness"), c.get("latencyMs"), c.get("memoryMb"), c.get("labeledExamples"), c.get("oneTimeCost"), c.get("recurringCost")
+            if not (type(avail) is bool and is_finite_num(qual) and 0 <= qual <= 1 and type(fresh) is bool and is_finite_num(lat) and lat >= 0 and is_finite_num(mem) and mem >= 0 and is_safe_int(lab) and is_finite_num(otc) and otc >= 0 and is_finite_num(rc) and rc >= 0):
+                reason_codes[n].add("INVALID_INPUT"); total_costs[n] = 0.0; continue
+            cost = round(otc + p_hr * rc, 12)
+            total_costs[n] = cost
+            if not avail: reason_codes[n].add("UNAVAILABLE")
+            if qual < p_mq: reason_codes[n].add("QUALITY_FLOOR")
+            if p_fr and not fresh: reason_codes[n].add("FRESHNESS_REQUIRED")
+            if lat > p_ml: reason_codes[n].add("LATENCY_LIMIT")
+            if mem > p_mm: reason_codes[n].add("MEMORY_LIMIT")
+            if lab > p_le: reason_codes[n].add("DATA_LIMIT")
+            if cost > p_mt: reason_codes[n].add("COST_LIMIT")
+            if not reason_codes[n]: eligible.append(n)
+        return jsonify({"selected": eligible[0] if eligible else None, "eligible": eligible, "totalCosts": total_costs, "reasonCodes": {n: sorted(list(reason_codes[n]), key=lambda x: x.encode('utf-8')) for n in req_names}})
+    if op == "repair":
+        reason_codes, toks, tok_valid, labels = set(), req.get("tokens"), True, []
+        if type(toks) is not list or not toks: tok_valid = False; reason_codes.add("INVALID_TOKEN")
+        else:
+            for t in toks:
+                if type(t) is not dict or not is_safe_int(t.get("id")) or t.get("role") not in ["system", "user", "assistant"] or type(t.get("padding")) is not bool or type(t.get("text")) is not str: tok_valid = False; break
+            if not tok_valid: reason_codes.add("INVALID_TOKEN"); labels = [-100] * len(toks) if type(toks) is list else []
+            else:
+                for t in toks: labels.append(t["id"] if t["role"] == "assistant" and t["padding"] is False else -100)
+        t_pass = True
+        if req.get("templateApplications") != 1: t_pass = False; reason_codes.add("CHAT_TEMPLATE_COUNT")
+        params, allowed_t, peft_pass, trainable, trainable_count = req.get("parameters"), req.get("allowedTargets"), True, [], 0
+        if type(params) is not list or type(allowed_t) is not list or not allowed_t: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
+        else:
+            tgt_set, tgt_valid = set(), True
+            for at in allowed_t:
+                if type(at) is not str or not at or at in tgt_set: tgt_valid = False; break
+                tgt_set.add(at)
+            p_names, p_valid = set(), True
+            for p in params:
+                if type(p) is not dict or type(p.get("name")) is not str or type(p.get("target")) is not str or not is_safe_pos_int(p.get("numel")) or p.get("name") in p_names: p_valid = False; break
+                p_names.add(p.get("name"))
+            if not tgt_valid or not p_valid: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
+            else:
+                for p in params:
+                    if p.get("target") in tgt_set and (p.get("name").endswith(".lora_A.weight") or p.get("name").endswith(".lora_B.weight")):
+                        trainable.append(p.get("name")); trainable_count += p.get("numel")
+                if not trainable: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
+                else: trainable.sort(key=lambda x: x.encode('utf-8'))
+        if req.get("inferenceMode") is not False: reason_codes.add("INFERENCE_MODE")
+        if req.get("dropoutActiveDuringEval") is not False: reason_codes.add("EVAL_DROPOUT_ACTIVE")
+        t_rows, e_rows = req.get("trainRowIds"), req.get("evalRowIds")
+        if type(t_rows) is not list or type(e_rows) is not list or not t_rows or not e_rows: reason_codes.add("EVAL_LEAKAGE")
+        else:
+            t_set, t_ok, e_set, e_ok = set(), True, set(), True
+            for r in t_rows:
+                if type(r) is not str or not r or r in t_set: t_ok = False; break
+                t_set.add(r)
+            for r in e_rows:
+                if type(r) is not str or not r or r in e_set: e_ok = False; break
+                e_set.add(r)
+            if not t_ok or not e_ok or not t_set.isdisjoint(e_set): reason_codes.add("EVAL_LEAKAGE")
+        af, adapter_files = req.get("artifactFiles"), []
+        if type(af) is not list: reason_codes.add("ADAPTER_FILE_SET")
+        else:
+            if "pytorch_model.bin" in af or "model.safetensors" in af: reason_codes.add("FULL_MODEL_ARTIFACT")
+            elif set(af) != {"adapter_config.json", "adapter_model.safetensors"} or len(af) != 2: reason_codes.add("ADAPTER_FILE_SET")
+            else: adapter_files = sorted(af, key=lambda x: x.encode('utf-8'))
+        br, dd, cd, cfd, ed = req.get("baseRevision"), req.get("datasetDigest"), req.get("codeDigest"), req.get("configDigest"), req.get("expectedDigests")
+        if type(br) is not str or not re.match(r'^[a-f0-9]{40}$', br): reason_codes.add("MUTABLE_BASE_REVISION")
+        if (type(ed) is not dict or type(dd) is not str or not re.match(r'^[a-f0-9]{64}$', dd) or dd != ed.get("dataset") or type(cd) is not str or not re.match(r'^[a-f0-9]{64}$', cd) or cd != ed.get("code") or type(cfd) is not str or not re.match(r'^[a-f0-9]{64}$', cfd) or cfd != ed.get("config")): reason_codes.add("LINEAGE_MISMATCH")
+        mb, ga, rep, eeb = req.get("microBatch"), req.get("gradientAccumulation"), req.get("replicas"), req.get("expectedEffectiveBatch")
+        if not (is_safe_pos_int(mb) and is_safe_pos_int(ga) and is_safe_pos_int(rep) and is_safe_pos_int(eeb) and mb * ga * rep == eeb): reason_codes.add("EFFECTIVE_BATCH_MISMATCH")
+        chk = req.get("checkpoint")
+        if type(chk) is not dict or set(chk.keys()) != {"model", "optimizer", "scheduler", "step", "rng", "dataPosition"}: reason_codes.add("INCOMPLETE_CHECKPOINT")
+        uw, rw, rt = req.get("uninterruptedWeights"), req.get("resumedWeights"), req.get("resumeTolerance")
+        if (type(uw) is not list or not uw or type(rw) is not list or not rw or len(uw) != len(rw) or not is_finite_num(rt) or rt < 0): reason_codes.add("RESUME_DIVERGENCE")
+        else:
+            w_ok = True
+            for u, r in zip(uw, rw):
+                if not is_finite_num(u) or not is_finite_num(r) or abs(u - r) > rt: w_ok = False; break
+            if not w_ok: reason_codes.add("RESUME_DIVERGENCE")
+        return jsonify({"labels": labels, "templatePass": t_pass, "trainableParams": trainable, "trainableCount": trainable_count, "peftConfigPass": peft_pass, "adapterFiles": adapter_files, "checkpointComplete": "INCOMPLETE_CHECKPOINT" not in reason_codes, "lineagePass": "MUTABLE_BASE_REVISION" not in reason_codes and "LINEAGE_MISMATCH" not in reason_codes, "evalIsolated": "EVAL_LEAKAGE" not in reason_codes, "evaluationDeterministic": "INFERENCE_MODE" not in reason_codes and "EVAL_DROPOUT_ACTIVE" not in reason_codes, "resumePass": "RESUME_DIVERGENCE" not in reason_codes, "reasonCodes": sorted(list(reason_codes), key=lambda x: x.encode('utf-8'))})
+
+@app.route('/quantize', methods=['POST'], strict_slashes=False)
+def quantize():
+    try: req = request.get_json(force=True)
+    except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
+    if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
+    phase = req.get("phase")
+    if phase not in ["freeze", "select"]: return jsonify({"error": "INVALID_INPUT"}), 400
+    if phase == "freeze":
+        cands = req.get("candidates")
+        if type(cands) is not list or len(cands) == 0: return jsonify({"error": "INVALID_INPUT"}), 400
+        fid, cal_dig, tok_dig, aur = req.get("freezeId"), req.get("calibrationDigest"), req.get("tokenizerDigest"), req.get("allowedUnsupportedReasons")
+        if fid in quantize_state:
+            if quantize_state[fid]['request'] != req: return jsonify({"error": "FREEZE_ID_CONFLICT"}), 409
+            return jsonify(quantize_state[fid]['response'])
+        out_cands = []
+        for c in cands:
+            if type(c) is not dict: continue 
+            cname = c.get("name")
+            if type(cname) is not str: continue
+            codes, files, inv, tb, pd = set(), c.get("files"), [], None, None
+            if type(files) is not dict or not files: codes.add("INVALID_INPUT")
+            else:
+                valid_files = True
+                for fn, fcontent in files.items():
+                    if type(fn) is not str or not fn or type(fcontent) is not str: valid_files = False; codes.add("INVALID_INPUT"); break
+                if valid_files:
+                    tb = 0
+                    for fn, fcontent in files.items():
+                        b = fcontent.encode('utf-8')
+                        inv.append({"name": fn, "bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()})
+                    inv.sort(key=lambda x: x["name"].encode('utf-8'))
+                    for x in inv: tb += x["bytes"]
+                    pd = hashlib.sha256(json.dumps([{"name": x["name"], "bytes": x["bytes"], "sha256": x["sha256"]} for x in inv], separators=(',', ':'), ensure_ascii=False).encode('utf-8')).hexdigest()
+            status, ureason = "frozen", c.get("unsupportedReason")
+            if "unsupportedReason" in c and type(ureason) is str:
+                if type(aur) is list and ureason in aur: status = "unsupported"
+                else: codes.add("UNALLOWED_UNSUPPORTED_REASON"); status = "invalid"
+            else:
+                if c.get("loadable") is not True: codes.add("NOT_LOADABLE")
+                if c.get("calibrationDigest") != cal_dig: codes.add("CALIBRATION_MISMATCH")
+                if c.get("tokenizerDigest") != tok_dig: codes.add("TOKENIZER_MISMATCH")
+                if codes: status = "invalid"
+            out_cands.append({"name": cname, "status": status, "inventory": inv if "INVALID_INPUT" not in codes else [], "totalBytes": tb, "packageDigest": pd, "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))})
+        out_cands.sort(key=lambda x: x["name"].encode('utf-8'))
+        res = {"freezeId": fid, "candidates": out_cands}
+        if type(fid) is str and fid: quantize_state[fid] = {"request": req, "response": res}
+        return jsonify(res)
+    elif phase == "select":
+        cands, rows, policy, fid, lats = req.get("candidates"), req.get("rows"), req.get("policy"), req.get("freezeId"), req.get("latencies")
+        if type(cands) is not list or type(rows) is not list or type(policy) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
+        is_policy_valid = True
+        mb, af, rs, ml, co = policy.get("maxBytes"), policy.get("aggregateFloor"), policy.get("requiredSlices"), policy.get("maxLatencyMs"), policy.get("candidateOrder")
+        if not (is_safe_pos_int(mb) or mb==0 and is_finite_num(af) and 0 <= af <= 1 and type(rs) is dict and is_finite_num(ml) and ml >= 0 and type(co) is list): is_policy_valid = False
+        else:
+            for k, v in rs.items():
+                if type(k) is not str or not is_finite_num(v) or not (0 <= v <= 1): is_policy_valid = False; break
+            for x in co:
+                if type(x) is not str: is_policy_valid = False; break
+            if len(set(co)) != len(co): is_policy_valid = False
+        cand_names = [c.get("name") for c in cands if type(c) is dict and type(c.get("name")) is str]
+        if is_policy_valid and set(cand_names) != set(co): is_policy_valid = False
+        is_frozen = type(fid) is str and fid in quantize_state
+        stored_cands = quantize_state[fid]["response"]["candidates"] if is_frozen else []
+        stored_cands_map = {c["name"]: c for c in stored_cands}
+        global_lineage_ok = True
+        if is_frozen and cands != stored_cands: global_lineage_ok = False
+        results, admitted_list = [], []
+        for c in cands:
+            if type(c) is not dict: continue
+            cname = c.get("name")
+            if type(cname) is not str: continue
+            codes = set()
+            if not is_frozen: codes.add("NOT_FROZEN")
+            if not is_policy_valid: codes.add("INVALID_POLICY")
+            if is_frozen and (not global_lineage_ok or cname not in stored_cands_map or c != stored_cands_map[cname]): codes.add("INVALID_LINEAGE")
+            cinv = c.get("inventory")
+            if type(cinv) is list:
+                cb = 0
+                for x in cinv:
+                    if type(x) is dict and type(x.get("bytes")) is int: cb += x["bytes"]
+                cpd = hashlib.sha256(json.dumps([{"name": x.get("name"), "bytes": x.get("bytes"), "sha256": x.get("sha256")} for x in cinv if type(x) is dict], separators=(',', ':'), ensure_ascii=False).encode('utf-8')).hexdigest()
+                if c.get("totalBytes") != cb or c.get("packageDigest") != cpd: codes.add("INVALID_MANIFEST")
+            else: codes.add("INVALID_MANIFEST")
+            lat = lats.get(cname) if type(lats) is dict else None
+            valid_lat = is_finite_num(lat) and lat >= 0
+            preds_valid = True
+            for r in rows:
+                if type(r) is not dict or "predictions" not in r or type(r["predictions"]) is not dict: preds_valid = False; break
+                if r["predictions"].get(cname) not in [0, 1] or r.get("label") not in [0, 1]: preds_valid = False; break
+            agg, sl_acc = None, None
+            if not preds_valid: codes.add("INVALID_PREDICTIONS")
+            else:
+                sl_acc = {}
+                if rows:
+                    agg = round(sum(1 for r in rows if r.get("label") == r["predictions"].get(cname)) / len(rows), 12)
+                    smets = {}
+                    for r in rows:
+                        sl = r.get("slice")
+                        if type(sl) is str:
+                            if sl not in smets: smets[sl] = {"c": 0, "t": 0}
+                            smets[sl]["t"] += 1
+                            if r.get("label") == r["predictions"].get(cname): smets[sl]["c"] += 1
+                    for sl, md in smets.items(): sl_acc[sl] = round(md["c"] / md["t"], 12)
+                else: agg = 0.0
+            if is_policy_valid:
+                if not valid_lat or lat > ml: codes.add("LATENCY_LIMIT")
+                tb = c.get("totalBytes")
+                if not is_safe_pos_int(tb) and tb != 0 or tb > mb: codes.add("SIZE_LIMIT")
+                if preds_valid:
+                    if agg < af: codes.add("AGGREGATE_FLOOR")
+                    for req_s, floor in rs.items():
+                        if req_s not in sl_acc: codes.add(f"MISSING_SLICE:{req_s}")
+                        elif sl_acc[req_s] < floor: codes.add(f"SLICE_FLOOR:{req_s}")
+            is_admitted = not codes and is_frozen and stored_cands_map.get(cname, {}).get("status") == "frozen"
+            valid_tb = (is_safe_pos_int(c.get("totalBytes")) or c.get("totalBytes") == 0) and "INVALID_MANIFEST" not in codes
+            res_obj = {"name": cname, "aggregate": agg, "slices": sl_acc, "totalBytes": c.get("totalBytes") if valid_tb else None, "latencyMs": lat if valid_lat else None, "admitted": is_admitted, "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))}
+            results.append(res_obj)
+            if is_admitted: admitted_list.append(res_obj)
+        def get_order_idx(n):
+            try: return co.index(n) if type(co) is list else 999999
+            except: return 999999
+        results.sort(key=lambda x: (get_order_idx(x["name"]), x["name"].encode('utf-8')))
+        admitted_list.sort(key=lambda x: (x["totalBytes"], x["latencyMs"], get_order_idx(x["name"])))
+        selected = admitted_list[0]["name"] if admitted_list else None
+        return jsonify({"freezeId": fid, "selected": selected, "results": results, "packageManifest": stored_cands_map.get(selected) if selected and is_frozen else None})
+
+@app.route('/pipeline', methods=['POST'], strict_slashes=False)
+def pipeline():
+    try: req = request.get_json(force=True)
+    except Exception: return jsonify({"error": "INVALID_REQUEST"}), 409
+    if not isinstance(req, dict): return jsonify({"error": "INVALID_REQUEST"}), 409
+    sess, rev, inputs, events = req.get("session"), req.get("revision"), req.get("inputs"), req.get("events")
+    if not isinstance(sess, str) or not sess or not is_safe_pos_int(rev) or not isinstance(inputs, dict): return jsonify({"error": "INVALID_REQUEST"}), 409
+    for k in ["generation", "checksum", "canonicalData", "prepareCode", "prepareConfig", "trainCode", "trainConfig", "runtime", "evaluateCode", "evaluateConfig", "schemaDigest", "publishConfig"]:
+        if type(inputs.get(k)) is not str or not inputs[k]: return jsonify({"error": "INVALID_REQUEST"}), 409
+    if not isinstance(events, list): return jsonify({"error": "INVALID_REQUEST"}), 409
+    if sess not in pipeline_state:
+        pipeline_state[sess] = {"session": sess, "revision": rev, "inputs": inputs, "cache": {n: {} for n in DAG_NODES}, "node_states": {}, "event_history": {}}
+    else:
+        state = pipeline_state[sess]
+        if rev > state["revision"]:
+            state["revision"], state["inputs"], state["node_states"] = rev, inputs, {}
+        elif rev == state["revision"] and state["inputs"] != inputs: return jsonify({"error": "REVISION_CONFLICT"}), 409
+    state = pipeline_state[sess]
+    batch_node_states = {k: dict(v) for k, v in state["node_states"].items()}
+    batch_cache = {n: {k: dict(v) for k, v in state["cache"][n].items()} for n in DAG_NODES}
+    batch_history = dict(state["event_history"])
+    accepted, ignored = [], []
+    current_keys = compute_keys(state["inputs"], batch_cache)
+    for e in events:
+        if not (isinstance(e, dict) and set(e.keys()) == {"eventId", "revision", "node", "attempt", "status", "key", "artifactDigest", "receiptId"} and isinstance(e["eventId"], str) and is_safe_pos_int(e["revision"]) and isinstance(e["node"], str) and is_safe_pos_int(e["attempt"]) and e["status"] in ["started", "succeeded", "retryable_failed", "terminal_failed"] and isinstance(e["key"], str) and (e["artifactDigest"] is None or isinstance(e["artifactDigest"], str)) and (e["receiptId"] is None or isinstance(e["receiptId"], str))): return jsonify({"error": "INVALID_EVENT"}), 409
+        c_json, eid = canon_json(e), e["eventId"]
+        if eid in batch_history:
+            if batch_history[eid] == c_json:
+                if eid not in accepted: ignored.append(eid)
+                continue
+            else: return jsonify({"error": "EVENT_ID_CONFLICT"}), 409
+        if e["revision"] != state["revision"] or e["node"] not in DAG_NODES or e["key"] != current_keys[e["node"]]: ignored.append(eid); continue
+        if e["status"] == "succeeded":
+            if not e["artifactDigest"]: ignored.append(eid); continue
+            if e["node"] in ["register", "publish"]:
+                if e["receiptId"] != f"receipt:{e['node']}:{e['key']}": ignored.append(eid); continue
+            elif e["receiptId"] is not None: ignored.append(eid); continue
+        else:
+            if e["artifactDigest"] is not None or e["receiptId"] is not None: ignored.append(eid); continue
+        node, key, cached, ns, action = e["node"], e["key"], batch_cache[e["node"]].get(e["key"]), batch_node_states.get(e["node"]), None
+        if cached:
+            if e["status"] == "succeeded":
+                if e["artifactDigest"] != cached["artifactDigest"]: return jsonify({"error": "EVIDENCE_CONFLICT"}), 409
+                else: action = "ignore"
+            else: return jsonify({"error": "STATUS_CONFLICT"}), 409
+        elif ns:
+            if ns["status"] == "terminal_failed": return jsonify({"error": "STATUS_CONFLICT"}), 409
+            elif ns["status"] == "started":
+                if e["attempt"] < ns["attempt"]: action = "ignore"
+                elif e["attempt"] == ns["attempt"]:
+                    if e["status"] in ["succeeded", "retryable_failed", "terminal_failed"]: action = "accept"
+                    else: return jsonify({"error": "STATUS_CONFLICT"}), 409
+                else: return jsonify({"error": "STATUS_CONFLICT"}), 409
+            elif ns["status"] == "retryable_failed":
+                if e["attempt"] < ns["attempt"]: action = "ignore"
+                elif e["attempt"] == ns["attempt"]: return jsonify({"error": "STATUS_CONFLICT"}), 409
+                elif e["attempt"] == ns["attempt"] + 1 and e["status"] == "started": action = "accept"
+                else: return jsonify({"error": "STATUS_CONFLICT"}), 409
+        else:
+            if e["attempt"] == 1 and e["status"] == "started": action = "accept"
+            else: action = "ignore"
+        if action == "accept":
+            accepted.append(eid); batch_history[eid] = c_json
+            if e["status"] == "succeeded":
+                batch_cache[node][key] = {"artifactDigest": e["artifactDigest"], "eventId": eid, "receiptId": e["receiptId"]}
+                if node in batch_node_states: del batch_node_states[node]
+                current_keys = compute_keys(state["inputs"], batch_cache)
+            else: batch_node_states[node] = {"status": e["status"], "attempt": e["attempt"], "eventId": eid, "key": key}
+        else: ignored.append(eid)
+    state["node_states"], state["cache"], state["event_history"] = batch_node_states, batch_cache, batch_history
+    current_keys = compute_keys(state["inputs"], state["cache"])
+    nodes_resp, ancestor_terminal = [], False
+    for node in DAG_NODES:
+        ckey = current_keys[node]
+        cached = state["cache"][node].get(ckey) if ckey else None
+        ns = state["node_states"].get(node)
+        deps = get_deps(node, state["inputs"], state["cache"], ckey, current_keys)
+        if cached: action_str, reason, trigger = "reuse", ["CACHE_HIT"], [cached["eventId"]]
+        else:
+            if ckey is not None:
+                if ns:
+                    if ns["status"] == "started": action_str, reason, trigger = "block", ["RUNNING"], [ns["eventId"]]
+                    elif ns["status"] == "terminal_failed": action_str, reason, trigger, ancestor_terminal = "block", ["TERMINAL_FAILURE"], [ns["eventId"]], True
+                    elif ns["status"] == "retryable_failed": action_str, reason, trigger = "rerun", ["RETRYABLE_FAILURE"], []
+                else: action_str, reason, trigger = "rerun", ["CACHE_MISS"], []
+            else: action_str, reason, trigger = "block", ["UPSTREAM_TERMINAL"] if ancestor_terminal else ["UPSTREAM_PENDING"], []
+        nodes_resp.append({"node": node, "action": action_str, "reasonCodes": reason, "dependencyDigests": deps, "triggeringEventIds": trigger})
+    return jsonify({"revision": state["revision"], "acceptedEventIds": accepted, "ignoredEventIds": ignored, "nodes": nodes_resp})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
