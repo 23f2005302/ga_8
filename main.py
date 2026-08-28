@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 bqml_state = {}
+quantize_state = {}
 
 @app.route('/', methods=['GET', 'POST'])
 def health_check():
@@ -36,76 +37,245 @@ def is_safe_pos_int(x):
 def is_finite_num(x):
     return type(x) in (int, float) and not isinstance(x, bool) and math.isfinite(x)
 
+
 # -----------------------------------------
-# NEW ENDPOINT: /adapt (Interventions & PEFT)
+# NEW ENDPOINT: /quantize (Candidate Admission)
+# -----------------------------------------
+@app.route('/quantize', methods=['POST'], strict_slashes=False)
+def quantize():
+    try: req = request.get_json(force=True)
+    except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
+    if type(req) is not dict or req.get("phase") not in ["freeze", "select"]:
+        return jsonify({"error": "INVALID_INPUT"}), 400
+        
+    phase = req["phase"]
+    
+    if phase == "freeze":
+        fid = req.get("freezeId")
+        cands = req.get("candidates")
+        cal_dig = req.get("calibrationDigest")
+        tok_dig = req.get("tokenizerDigest")
+        aur = req.get("allowedUnsupportedReasons")
+        
+        if (type(fid) is not str or not fid or len(fid) > 128 or
+            type(cands) is not list or not cands or type(cal_dig) is not str or not cal_dig or
+            type(tok_dig) is not str or not tok_dig or type(aur) is not list):
+            return jsonify({"error": "INVALID_INPUT"}), 400
+            
+        for r in aur:
+            if type(r) is not str or not r: return jsonify({"error": "INVALID_INPUT"}), 400
+        if len(set(aur)) != len(aur): return jsonify({"error": "INVALID_INPUT"}), 400
+            
+        if fid in quantize_state:
+            if quantize_state[fid]['request'] != req: return jsonify({"error": "FREEZE_ID_CONFLICT"}), 409
+            return jsonify(quantize_state[fid]['response'])
+            
+        cand_names = set()
+        out_cands = []
+        
+        for c in cands:
+            if type(c) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
+            cname = c.get("name")
+            if type(cname) is not str or not cname or cname in cand_names:
+                return jsonify({"error": "INVALID_INPUT"}), 400
+            cand_names.add(cname)
+            
+            codes = set()
+            files = c.get("files")
+            inv = []
+            tb = None
+            pd = None
+            
+            valid_files = True
+            if type(files) is not dict or not files:
+                valid_files = False; codes.add("INVALID_INPUT")
+            else:
+                for fn, fcontent in files.items():
+                    if type(fn) is not str or not fn or type(fcontent) is not str:
+                        valid_files = False; codes.add("INVALID_INPUT"); break
+                        
+            if valid_files:
+                tb = 0
+                for fn, fcontent in files.items():
+                    b = fcontent.encode('utf-8')
+                    inv.append({"name": fn, "bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()})
+                inv.sort(key=lambda x: x["name"].encode('utf-8'))
+                for x in inv: tb += x["bytes"]
+                inv_json = json.dumps([{"name": x["name"], "bytes": x["bytes"], "sha256": x["sha256"]} for x in inv], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                pd = hashlib.sha256(inv_json).hexdigest()
+                
+            status = "frozen"
+            ureason = c.get("unsupportedReason")
+            
+            if "unsupportedReason" in c and type(ureason) is str:
+                if ureason in aur: status = "unsupported"
+                else: codes.add("UNALLOWED_UNSUPPORTED_REASON"); status = "invalid"
+            else:
+                if c.get("loadable") is not True: codes.add("NOT_LOADABLE")
+                if c.get("calibrationDigest") != cal_dig: codes.add("CALIBRATION_MISMATCH")
+                if c.get("tokenizerDigest") != tok_dig: codes.add("TOKENIZER_MISMATCH")
+                if codes: status = "invalid"
+                
+            out_cands.append({
+                "name": cname, "status": status,
+                "inventory": inv if valid_files else [],
+                "totalBytes": tb, "packageDigest": pd,
+                "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
+            })
+            
+        out_cands.sort(key=lambda x: x["name"].encode('utf-8'))
+        res = {"freezeId": fid, "candidates": out_cands}
+        quantize_state[fid] = {"request": req, "response": res}
+        return jsonify(res)
+        
+    elif phase == "select":
+        fid = req.get("freezeId")
+        cands = req.get("candidates")
+        policy = req.get("policy")
+        lats = req.get("latencies")
+        rows = req.get("rows")
+        
+        if type(cands) is not list or type(rows) is not list or type(policy) is not dict:
+            return jsonify({"error": "INVALID_INPUT"}), 400
+            
+        is_policy_valid = True
+        mb, af, rs, ml, co = policy.get("maxBytes"), policy.get("aggregateFloor"), policy.get("requiredSlices"), policy.get("maxLatencyMs"), policy.get("candidateOrder")
+        
+        if not (is_safe_int(mb) and mb >= 0 and is_finite_num(af) and 0 <= af <= 1 and type(rs) is dict and is_finite_num(ml) and ml >= 0 and type(co) is list):
+            is_policy_valid = False
+        else:
+            for k, v in rs.items():
+                if type(k) is not str or not is_finite_num(v) or not (0 <= v <= 1): is_policy_valid = False; break
+            for x in co:
+                if type(x) is not str: is_policy_valid = False; break
+            if len(set(co)) != len(co): is_policy_valid = False
+            
+        cand_names = [c.get("name") for c in cands if type(c) is dict and type(c.get("name")) is str]
+        if is_policy_valid and set(cand_names) != set(co): is_policy_valid = False
+            
+        is_frozen = fid in quantize_state
+        stored_cands = quantize_state[fid]["response"]["candidates"] if is_frozen else []
+        stored_cands_map = {c["name"]: c for c in stored_cands}
+        
+        global_lineage_ok = True
+        if is_frozen and cands != stored_cands: global_lineage_ok = False
+                
+        results, admitted_list = [], []
+        
+        for c in cands:
+            if type(c) is not dict: continue
+            cname = c.get("name")
+            if type(cname) is not str: continue
+            
+            codes = set()
+            if not is_frozen: codes.add("NOT_FROZEN")
+            if not is_policy_valid: codes.add("INVALID_POLICY")
+            
+            if is_frozen and (not global_lineage_ok or cname not in stored_cands_map or c != stored_cands_map[cname]):
+                codes.add("INVALID_LINEAGE")
+                
+            cinv = c.get("inventory")
+            if type(cinv) is list:
+                cb = 0
+                for x in cinv:
+                    if type(x) is dict and type(x.get("bytes")) is int: cb += x["bytes"]
+                c_json = json.dumps([{"name": x.get("name"), "bytes": x.get("bytes"), "sha256": x.get("sha256")} for x in cinv if type(x) is dict], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                cpd = hashlib.sha256(c_json).hexdigest()
+                if c.get("totalBytes") != cb or c.get("packageDigest") != cpd: codes.add("INVALID_MANIFEST")
+            else:
+                codes.add("INVALID_MANIFEST")
+                
+            lat = lats.get(cname) if type(lats) is dict else None
+            valid_lat = is_finite_num(lat) and lat >= 0
+            
+            preds_valid = True
+            for r in rows:
+                if type(r) is not dict or "predictions" not in r or type(r["predictions"]) is not dict: preds_valid = False; break
+                pval = r["predictions"].get(cname)
+                if pval not in [0, 1] or r.get("label") not in [0, 1]: preds_valid = False; break
+                    
+            agg = None
+            sl_acc = {}
+            
+            if not preds_valid: codes.add("INVALID_PREDICTIONS")
+            else:
+                if rows:
+                    agg = round(sum(1 for r in rows if r.get("label") == r["predictions"].get(cname)) / len(rows), 12)
+                    smets = {}
+                    for r in rows:
+                        sl = r.get("slice")
+                        if type(sl) is str:
+                            if sl not in smets: smets[sl] = {"c": 0, "t": 0}
+                            smets[sl]["t"] += 1
+                            if r.get("label") == r["predictions"].get(cname): smets[sl]["c"] += 1
+                    for sl, md in smets.items(): sl_acc[sl] = round(md["c"] / md["t"], 12)
+                else: agg = 0.0
+                    
+            if is_policy_valid:
+                if not valid_lat or lat > ml: codes.add("LATENCY_LIMIT")
+                tb = c.get("totalBytes")
+                if not is_safe_int(tb) or tb > mb: codes.add("SIZE_LIMIT")
+                if preds_valid:
+                    if agg < af: codes.add("AGGREGATE_FLOOR")
+                    for req_s, floor in rs.items():
+                        if req_s not in sl_acc: codes.add(f"MISSING_SLICE:{req_s}")
+                        elif sl_acc[req_s] < floor: codes.add(f"SLICE_FLOOR:{req_s}")
+                            
+            is_admitted = not codes and is_frozen and stored_cands_map.get(cname, {}).get("status") == "frozen"
+            
+            res_obj = {
+                "name": cname, "aggregate": agg, "slices": sl_acc if preds_valid else {},
+                "totalBytes": c.get("totalBytes") if is_safe_int(c.get("totalBytes")) else None,
+                "latencyMs": lat if valid_lat else None, "admitted": is_admitted,
+                "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
+            }
+            results.append(res_obj)
+            if is_admitted: admitted_list.append(res_obj)
+                
+        def get_order_idx(n):
+            try: return co.index(n) if type(co) is list else 999999
+            except: return 999999
+            
+        results.sort(key=lambda x: (get_order_idx(x["name"]), x["name"].encode('utf-8')))
+        admitted_list.sort(key=lambda x: (x["totalBytes"], x["latencyMs"], get_order_idx(x["name"])))
+        
+        selected = admitted_list[0]["name"] if admitted_list else None
+        pkg_manifest = stored_cands_map.get(selected) if selected and is_frozen else None
+            
+        return jsonify({
+            "freezeId": fid, "selected": selected, "results": results, "packageManifest": pkg_manifest
+        })
+
+# -----------------------------------------
+# PREVIOUS ENDPOINTS (DO NOT REMOVE)
 # -----------------------------------------
 @app.route('/adapt', methods=['POST'], strict_slashes=False)
 def adapt():
     try: req = request.get_json(force=True)
     except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
-
     if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
     op = req.get("operation")
     if op not in ["choose", "repair"]: return jsonify({"error": "INVALID_INPUT"}), 400
-
     if op == "choose":
-        policy = req.get("policy")
-        cands = req.get("candidates")
-        
-        if type(policy) is not dict or type(cands) is not list:
-            return jsonify({"error": "INVALID_INPUT"}), 400
-            
+        policy, cands = req.get("policy"), req.get("candidates")
+        if type(policy) is not dict or type(cands) is not list: return jsonify({"error": "INVALID_INPUT"}), 400
         req_names = ["prompt_only", "retrieval", "lora", "qlora"]
         cand_map = {}
         for c in cands:
-            if type(c) is dict and "name" in c and type(c["name"]) is str:
-                cand_map[c["name"]] = cand_map.get(c["name"], 0) + 1
-        
+            if type(c) is dict and "name" in c and type(c["name"]) is str: cand_map[c["name"]] = cand_map.get(c["name"], 0) + 1
         for n in req_names:
-            if cand_map.get(n, 0) != 1:
-                return jsonify({"error": "INVALID_INPUT"}), 400
-                
-        p_mq = policy.get("minQuality")
-        p_fr = policy.get("freshnessRequired")
-        p_ml = policy.get("maxLatencyMs")
-        p_mm = policy.get("maxMemoryMb")
-        p_le = policy.get("maxLabeledExamples")
-        p_mt = policy.get("maxTotalCost")
-        p_hr = policy.get("horizonRequests")
-        
-        if not (is_finite_num(p_mq) and 0 <= p_mq <= 1 and type(p_fr) is bool and
-                is_finite_num(p_ml) and p_ml >= 0 and is_finite_num(p_mm) and p_mm >= 0 and
-                is_safe_int(p_le) and is_finite_num(p_mt) and p_mt >= 0 and is_safe_int(p_hr)):
-            return jsonify({"error": "INVALID_INPUT"}), 400
-
-        total_costs = {}
-        reason_codes = {n: set() for n in req_names}
-        eligible = []
-
+            if cand_map.get(n, 0) != 1: return jsonify({"error": "INVALID_INPUT"}), 400
+        p_mq, p_fr, p_ml, p_mm, p_le, p_mt, p_hr = policy.get("minQuality"), policy.get("freshnessRequired"), policy.get("maxLatencyMs"), policy.get("maxMemoryMb"), policy.get("maxLabeledExamples"), policy.get("maxTotalCost"), policy.get("horizonRequests")
+        if not (is_finite_num(p_mq) and 0 <= p_mq <= 1 and type(p_fr) is bool and is_finite_num(p_ml) and p_ml >= 0 and is_finite_num(p_mm) and p_mm >= 0 and is_safe_int(p_le) and is_finite_num(p_mt) and p_mt >= 0 and is_safe_int(p_hr)): return jsonify({"error": "INVALID_INPUT"}), 400
+        total_costs, reason_codes, eligible = {}, {n: set() for n in req_names}, []
         cand_dicts = {c["name"]: c for c in cands if type(c) is dict and c.get("name") in req_names}
-        
         for n in req_names:
             c = cand_dicts[n]
-            avail = c.get("available")
-            qual = c.get("quality")
-            fresh = c.get("freshness")
-            lat = c.get("latencyMs")
-            mem = c.get("memoryMb")
-            lab = c.get("labeledExamples")
-            otc = c.get("oneTimeCost")
-            rc = c.get("recurringCost")
-            
-            if not (type(avail) is bool and is_finite_num(qual) and 0 <= qual <= 1 and
-                    type(fresh) is bool and is_finite_num(lat) and lat >= 0 and
-                    is_finite_num(mem) and mem >= 0 and is_safe_int(lab) and
-                    is_finite_num(otc) and otc >= 0 and is_finite_num(rc) and rc >= 0):
-                reason_codes[n].add("INVALID_INPUT")
-                total_costs[n] = 0.0
-                continue
-                
+            avail, qual, fresh, lat, mem, lab, otc, rc = c.get("available"), c.get("quality"), c.get("freshness"), c.get("latencyMs"), c.get("memoryMb"), c.get("labeledExamples"), c.get("oneTimeCost"), c.get("recurringCost")
+            if not (type(avail) is bool and is_finite_num(qual) and 0 <= qual <= 1 and type(fresh) is bool and is_finite_num(lat) and lat >= 0 and is_finite_num(mem) and mem >= 0 and is_safe_int(lab) and is_finite_num(otc) and otc >= 0 and is_finite_num(rc) and rc >= 0):
+                reason_codes[n].add("INVALID_INPUT"); total_costs[n] = 0.0; continue
             cost = round(otc + p_hr * rc, 12)
             total_costs[n] = cost
-            
             if not avail: reason_codes[n].add("UNAVAILABLE")
             if qual < p_mq: reason_codes[n].add("QUALITY_FLOOR")
             if p_fr and not fresh: reason_codes[n].add("FRESHNESS_REQUIRED")
@@ -113,192 +283,72 @@ def adapt():
             if mem > p_mm: reason_codes[n].add("MEMORY_LIMIT")
             if lab > p_le: reason_codes[n].add("DATA_LIMIT")
             if cost > p_mt: reason_codes[n].add("COST_LIMIT")
-            
-            if not reason_codes[n]:
-                eligible.append(n)
-                
-        out_codes = {n: sorted(list(reason_codes[n]), key=lambda x: x.encode('utf-8')) for n in req_names}
-        selected = eligible[0] if eligible else None
-        
-        return jsonify({
-            "selected": selected,
-            "eligible": eligible,
-            "totalCosts": total_costs,
-            "reasonCodes": out_codes
-        })
-
+            if not reason_codes[n]: eligible.append(n)
+        return jsonify({"selected": eligible[0] if eligible else None, "eligible": eligible, "totalCosts": total_costs, "reasonCodes": {n: sorted(list(reason_codes[n]), key=lambda x: x.encode('utf-8')) for n in req_names}})
     if op == "repair":
-        reason_codes = set()
-        
-        toks = req.get("tokens")
-        tok_valid = True
-        labels = []
-        if type(toks) is not list or not toks:
-            tok_valid = False
-            reason_codes.add("INVALID_TOKEN")
+        reason_codes, toks, tok_valid, labels = set(), req.get("tokens"), True, []
+        if type(toks) is not list or not toks: tok_valid = False; reason_codes.add("INVALID_TOKEN")
         else:
             for t in toks:
-                if type(t) is not dict: tok_valid = False; break
-                tid = t.get("id"); r = t.get("role"); p = t.get("padding"); txt = t.get("text")
-                if not is_safe_int(tid) or r not in ["system", "user", "assistant"] or type(p) is not bool or type(txt) is not str:
-                    tok_valid = False; break
-            
-            if not tok_valid:
-                reason_codes.add("INVALID_TOKEN")
-                labels = [-100] * len(toks) if type(toks) is list else []
+                if type(t) is not dict or not is_safe_int(t.get("id")) or t.get("role") not in ["system", "user", "assistant"] or type(t.get("padding")) is not bool or type(t.get("text")) is not str: tok_valid = False; break
+            if not tok_valid: reason_codes.add("INVALID_TOKEN"); labels = [-100] * len(toks) if type(toks) is list else []
             else:
-                for t in toks:
-                    if t["role"] == "assistant" and t["padding"] is False:
-                        labels.append(t["id"])
-                    else:
-                        labels.append(-100)
-
-        t_apps = req.get("templateApplications")
+                for t in toks: labels.append(t["id"] if t["role"] == "assistant" and t["padding"] is False else -100)
         t_pass = True
-        if t_apps != 1:
-            t_pass = False
-            reason_codes.add("CHAT_TEMPLATE_COUNT")
-
-        params = req.get("parameters")
-        allowed_t = req.get("allowedTargets")
-        peft_pass = True
-        trainable = []
-        trainable_count = 0
-        
-        if type(params) is not list or type(allowed_t) is not list or not allowed_t:
-            peft_pass = False; reason_codes.add("INVALID_PARAMETER")
+        if req.get("templateApplications") != 1: t_pass = False; reason_codes.add("CHAT_TEMPLATE_COUNT")
+        params, allowed_t, peft_pass, trainable, trainable_count = req.get("parameters"), req.get("allowedTargets"), True, [], 0
+        if type(params) is not list or type(allowed_t) is not list or not allowed_t: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
         else:
-            tgt_set = set()
-            tgt_valid = True
+            tgt_set, tgt_valid = set(), True
             for at in allowed_t:
-                if type(at) is not str or not at or at in tgt_set:
-                    tgt_valid = False; break
+                if type(at) is not str or not at or at in tgt_set: tgt_valid = False; break
                 tgt_set.add(at)
-                
-            p_names = set()
-            p_valid = True
+            p_names, p_valid = set(), True
             for p in params:
-                if type(p) is not dict: p_valid = False; break
-                nm = p.get("name"); tgt = p.get("target"); ne = p.get("numel")
-                if type(nm) is not str or type(tgt) is not str or not is_safe_pos_int(ne): p_valid = False; break
-                if nm in p_names: p_valid = False; break
-                p_names.add(nm)
-                
-            if not tgt_valid or not p_valid:
-                peft_pass = False; reason_codes.add("INVALID_PARAMETER")
+                if type(p) is not dict or type(p.get("name")) is not str or type(p.get("target")) is not str or not is_safe_pos_int(p.get("numel")) or p.get("name") in p_names: p_valid = False; break
+                p_names.add(p.get("name"))
+            if not tgt_valid or not p_valid: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
             else:
                 for p in params:
-                    nm = p.get("name"); tgt = p.get("target"); ne = p.get("numel")
-                    if tgt in tgt_set and (nm.endswith(".lora_A.weight") or nm.endswith(".lora_B.weight")):
-                        trainable.append(nm)
-                        trainable_count += ne
-                
-                if not trainable:
-                    peft_pass = False; reason_codes.add("INVALID_PARAMETER")
-                else:
-                    trainable.sort(key=lambda x: x.encode('utf-8'))
-
-        inf = req.get("inferenceMode")
-        if inf is not False: reason_codes.add("INFERENCE_MODE")
-        
-        dr_eval = req.get("dropoutActiveDuringEval")
-        if dr_eval is not False: reason_codes.add("EVAL_DROPOUT_ACTIVE")
-        
-        t_rows = req.get("trainRowIds")
-        e_rows = req.get("evalRowIds")
-        if type(t_rows) is not list or type(e_rows) is not list or not t_rows or not e_rows:
-            reason_codes.add("EVAL_LEAKAGE")
+                    if p.get("target") in tgt_set and (p.get("name").endswith(".lora_A.weight") or p.get("name").endswith(".lora_B.weight")):
+                        trainable.append(p.get("name")); trainable_count += p.get("numel")
+                if not trainable: peft_pass = False; reason_codes.add("INVALID_PARAMETER")
+                else: trainable.sort(key=lambda x: x.encode('utf-8'))
+        if req.get("inferenceMode") is not False: reason_codes.add("INFERENCE_MODE")
+        if req.get("dropoutActiveDuringEval") is not False: reason_codes.add("EVAL_DROPOUT_ACTIVE")
+        t_rows, e_rows = req.get("trainRowIds"), req.get("evalRowIds")
+        if type(t_rows) is not list or type(e_rows) is not list or not t_rows or not e_rows: reason_codes.add("EVAL_LEAKAGE")
         else:
-            t_set = set()
-            t_ok = True
+            t_set, t_ok, e_set, e_ok = set(), True, set(), True
             for r in t_rows:
                 if type(r) is not str or not r or r in t_set: t_ok = False; break
                 t_set.add(r)
-            e_set = set()
-            e_ok = True
             for r in e_rows:
                 if type(r) is not str or not r or r in e_set: e_ok = False; break
                 e_set.add(r)
-            if not t_ok or not e_ok or not t_set.isdisjoint(e_set):
-                reason_codes.add("EVAL_LEAKAGE")
-
-        af = req.get("artifactFiles")
-        adapter_files = []
-        if type(af) is not list:
-            reason_codes.add("ADAPTER_FILE_SET")
+            if not t_ok or not e_ok or not t_set.isdisjoint(e_set): reason_codes.add("EVAL_LEAKAGE")
+        af, adapter_files = req.get("artifactFiles"), []
+        if type(af) is not list: reason_codes.add("ADAPTER_FILE_SET")
         else:
-            if "pytorch_model.bin" in af or "model.safetensors" in af:
-                reason_codes.add("FULL_MODEL_ARTIFACT")
-            elif set(af) != {"adapter_config.json", "adapter_model.safetensors"} or len(af) != 2:
-                reason_codes.add("ADAPTER_FILE_SET")
-            else:
-                adapter_files = sorted(af, key=lambda x: x.encode('utf-8'))
-
-        br = req.get("baseRevision")
-        if type(br) is not str or not re.match(r'^[a-f0-9]{40}$', br):
-            reason_codes.add("MUTABLE_BASE_REVISION")
-            
-        dd = req.get("datasetDigest")
-        cd = req.get("codeDigest")
-        cfd = req.get("configDigest")
-        ed = req.get("expectedDigests")
-        
-        if (type(ed) is not dict or
-            type(dd) is not str or not re.match(r'^[a-f0-9]{64}$', dd) or dd != ed.get("dataset") or
-            type(cd) is not str or not re.match(r'^[a-f0-9]{64}$', cd) or cd != ed.get("code") or
-            type(cfd) is not str or not re.match(r'^[a-f0-9]{64}$', cfd) or cfd != ed.get("config")):
-            reason_codes.add("LINEAGE_MISMATCH")
-
-        mb = req.get("microBatch")
-        ga = req.get("gradientAccumulation")
-        rep = req.get("replicas")
-        eeb = req.get("expectedEffectiveBatch")
-        if not (is_safe_pos_int(mb) and is_safe_pos_int(ga) and is_safe_pos_int(rep) and is_safe_pos_int(eeb) and mb * ga * rep == eeb):
-            reason_codes.add("EFFECTIVE_BATCH_MISMATCH")
-
+            if "pytorch_model.bin" in af or "model.safetensors" in af: reason_codes.add("FULL_MODEL_ARTIFACT")
+            elif set(af) != {"adapter_config.json", "adapter_model.safetensors"} or len(af) != 2: reason_codes.add("ADAPTER_FILE_SET")
+            else: adapter_files = sorted(af, key=lambda x: x.encode('utf-8'))
+        br, dd, cd, cfd, ed = req.get("baseRevision"), req.get("datasetDigest"), req.get("codeDigest"), req.get("configDigest"), req.get("expectedDigests")
+        if type(br) is not str or not re.match(r'^[a-f0-9]{40}$', br): reason_codes.add("MUTABLE_BASE_REVISION")
+        if (type(ed) is not dict or type(dd) is not str or not re.match(r'^[a-f0-9]{64}$', dd) or dd != ed.get("dataset") or type(cd) is not str or not re.match(r'^[a-f0-9]{64}$', cd) or cd != ed.get("code") or type(cfd) is not str or not re.match(r'^[a-f0-9]{64}$', cfd) or cfd != ed.get("config")): reason_codes.add("LINEAGE_MISMATCH")
+        mb, ga, rep, eeb = req.get("microBatch"), req.get("gradientAccumulation"), req.get("replicas"), req.get("expectedEffectiveBatch")
+        if not (is_safe_pos_int(mb) and is_safe_pos_int(ga) and is_safe_pos_int(rep) and is_safe_pos_int(eeb) and mb * ga * rep == eeb): reason_codes.add("EFFECTIVE_BATCH_MISMATCH")
         chk = req.get("checkpoint")
-        if type(chk) is not dict or set(chk.keys()) != {"model", "optimizer", "scheduler", "step", "rng", "dataPosition"}:
-            reason_codes.add("INCOMPLETE_CHECKPOINT")
-
-        uw = req.get("uninterruptedWeights")
-        rw = req.get("resumedWeights")
-        rt = req.get("resumeTolerance")
-        
-        if (type(uw) is not list or not uw or type(rw) is not list or not rw or
-            len(uw) != len(rw) or not is_finite_num(rt) or rt < 0):
-            reason_codes.add("RESUME_DIVERGENCE")
+        if type(chk) is not dict or set(chk.keys()) != {"model", "optimizer", "scheduler", "step", "rng", "dataPosition"}: reason_codes.add("INCOMPLETE_CHECKPOINT")
+        uw, rw, rt = req.get("uninterruptedWeights"), req.get("resumedWeights"), req.get("resumeTolerance")
+        if (type(uw) is not list or not uw or type(rw) is not list or not rw or len(uw) != len(rw) or not is_finite_num(rt) or rt < 0): reason_codes.add("RESUME_DIVERGENCE")
         else:
             w_ok = True
             for u, r in zip(uw, rw):
-                if not is_finite_num(u) or not is_finite_num(r) or abs(u - r) > rt:
-                    w_ok = False; break
-            if not w_ok:
-                reason_codes.add("RESUME_DIVERGENCE")
-                
-        eval_iso = "EVAL_LEAKAGE" not in reason_codes
-        eval_det = "INFERENCE_MODE" not in reason_codes and "EVAL_DROPOUT_ACTIVE" not in reason_codes
-        lin_pass = "MUTABLE_BASE_REVISION" not in reason_codes and "LINEAGE_MISMATCH" not in reason_codes
-        chk_comp = "INCOMPLETE_CHECKPOINT" not in reason_codes
-        res_pass = "RESUME_DIVERGENCE" not in reason_codes
+                if not is_finite_num(u) or not is_finite_num(r) or abs(u - r) > rt: w_ok = False; break
+            if not w_ok: reason_codes.add("RESUME_DIVERGENCE")
+        return jsonify({"labels": labels, "templatePass": t_pass, "trainableParams": trainable, "trainableCount": trainable_count, "peftConfigPass": peft_pass, "adapterFiles": adapter_files, "checkpointComplete": "INCOMPLETE_CHECKPOINT" not in reason_codes, "lineagePass": "MUTABLE_BASE_REVISION" not in reason_codes and "LINEAGE_MISMATCH" not in reason_codes, "evalIsolated": "EVAL_LEAKAGE" not in reason_codes, "evaluationDeterministic": "INFERENCE_MODE" not in reason_codes and "EVAL_DROPOUT_ACTIVE" not in reason_codes, "resumePass": "RESUME_DIVERGENCE" not in reason_codes, "reasonCodes": sorted(list(reason_codes), key=lambda x: x.encode('utf-8'))})
 
-        return jsonify({
-            "labels": labels,
-            "templatePass": t_pass,
-            "trainableParams": trainable,
-            "trainableCount": trainable_count,
-            "peftConfigPass": peft_pass,
-            "adapterFiles": adapter_files,
-            "checkpointComplete": chk_comp,
-            "lineagePass": lin_pass,
-            "evalIsolated": eval_iso,
-            "evaluationDeterministic": eval_det,
-            "resumePass": res_pass,
-            "reasonCodes": sorted(list(reason_codes), key=lambda x: x.encode('utf-8'))
-        })
-
-# -----------------------------------------
-# PREVIOUS ROUTES (DO NOT REMOVE)
-# -----------------------------------------
 @app.route('/promote', methods=['POST'], strict_slashes=False)
 def promote():
     try: req = request.get_json(force=True)
