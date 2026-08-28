@@ -1,7 +1,17 @@
-import json, re, unicodedata, hashlib
+import json
+import re
+import unicodedata
+import hashlib
 from datetime import datetime, timezone
 import google_crc32c
-from flask import request, jsonify
+from flask import Flask, request, jsonify
+
+# This is the line that was missing!
+app = Flask(__name__)
+
+@app.route('/', methods=['GET', 'POST'])
+def health_check():
+    return "Server is up and running!", 200
 
 def is_valid_iso8601(dt_str):
     pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-](0[0-9]|1[0-3]):[0-5][0-9]|14:00)$'
@@ -46,7 +56,8 @@ def build_corpus():
         if not isinstance(uri, str): obj_codes.append("URI_INVALID")
         elif uri != "gs://bucket/object": obj_codes.append("URI_INVALID")
             
-        gen, f_gen = obj.get('generation'), obj.get('fetchedGeneration')
+        gen = obj.get('generation')
+        f_gen = obj.get('fetchedGeneration')
         if not isinstance(gen, str) or not re.match(r'^\d+$', gen): obj_codes.append("GENERATION_INVALID")
         elif gen != f_gen: obj_codes.append("GENERATION_MISMATCH")
 
@@ -156,7 +167,7 @@ def build_corpus():
             lines.append(json.dumps({"id": r['id'], "entity": r['entity'], "eventTime": r['eventTime_norm'], "revision": r['revision'], "text": r['text']}, separators=(',', ':'), ensure_ascii=False))
         out_str = "".join(l + "\n" for l in lines).encode('utf-8')
         digests[s_name] = hashlib.sha256(out_str).hexdigest()
-        final_splits[s_name] = [json.loads(l) for l in lines] # Output requires array of objects
+        final_splits[s_name] = [json.loads(l) for l in lines]
 
     rej_objs.sort(key=lambda x: (str(x['uri']).encode('utf-8'), json.dumps(x, separators=(',', ':')).encode('utf-8')))
     rej_rows.sort(key=lambda x: (x['id'].encode('utf-8'), json.dumps(x, separators=(',', ':')).encode('utf-8')))
@@ -169,3 +180,6 @@ def build_corpus():
         "digests": digests,
         "lineage": lineage
     })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
