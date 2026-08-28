@@ -39,46 +39,38 @@ def is_finite_num(x):
 
 
 # -----------------------------------------
-# NEW ENDPOINT: /quantize (Candidate Admission)
+# FIXED ENDPOINT: /quantize
 # -----------------------------------------
 @app.route('/quantize', methods=['POST'], strict_slashes=False)
 def quantize():
     try: req = request.get_json(force=True)
     except Exception: return jsonify({"error": "INVALID_INPUT"}), 400
-    if type(req) is not dict or req.get("phase") not in ["freeze", "select"]:
+    
+    if type(req) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
+    phase = req.get("phase")
+    if phase not in ["freeze", "select"]:
         return jsonify({"error": "INVALID_INPUT"}), 400
         
-    phase = req["phase"]
-    
     if phase == "freeze":
-        fid = req.get("freezeId")
         cands = req.get("candidates")
+        # ONLY return 400 if candidate list is empty/non-array as strictly requested
+        if type(cands) is not list or len(cands) == 0:
+            return jsonify({"error": "INVALID_INPUT"}), 400
+            
+        fid = req.get("freezeId")
         cal_dig = req.get("calibrationDigest")
         tok_dig = req.get("tokenizerDigest")
         aur = req.get("allowedUnsupportedReasons")
         
-        if (type(fid) is not str or not fid or len(fid) > 128 or
-            type(cands) is not list or not cands or type(cal_dig) is not str or not cal_dig or
-            type(tok_dig) is not str or not tok_dig or type(aur) is not list):
-            return jsonify({"error": "INVALID_INPUT"}), 400
-            
-        for r in aur:
-            if type(r) is not str or not r: return jsonify({"error": "INVALID_INPUT"}), 400
-        if len(set(aur)) != len(aur): return jsonify({"error": "INVALID_INPUT"}), 400
-            
         if fid in quantize_state:
             if quantize_state[fid]['request'] != req: return jsonify({"error": "FREEZE_ID_CONFLICT"}), 409
             return jsonify(quantize_state[fid]['response'])
             
-        cand_names = set()
         out_cands = []
-        
         for c in cands:
-            if type(c) is not dict: return jsonify({"error": "INVALID_INPUT"}), 400
+            if type(c) is not dict: continue 
             cname = c.get("name")
-            if type(cname) is not str or not cname or cname in cand_names:
-                return jsonify({"error": "INVALID_INPUT"}), 400
-            cand_names.add(cname)
+            if type(cname) is not str: continue
             
             codes = set()
             files = c.get("files")
@@ -86,29 +78,30 @@ def quantize():
             tb = None
             pd = None
             
-            valid_files = True
             if type(files) is not dict or not files:
-                valid_files = False; codes.add("INVALID_INPUT")
+                codes.add("INVALID_INPUT")
             else:
+                valid_files = True
                 for fn, fcontent in files.items():
                     if type(fn) is not str or not fn or type(fcontent) is not str:
-                        valid_files = False; codes.add("INVALID_INPUT"); break
-                        
-            if valid_files:
-                tb = 0
-                for fn, fcontent in files.items():
-                    b = fcontent.encode('utf-8')
-                    inv.append({"name": fn, "bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()})
-                inv.sort(key=lambda x: x["name"].encode('utf-8'))
-                for x in inv: tb += x["bytes"]
-                inv_json = json.dumps([{"name": x["name"], "bytes": x["bytes"], "sha256": x["sha256"]} for x in inv], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-                pd = hashlib.sha256(inv_json).hexdigest()
-                
+                        valid_files = False
+                        codes.add("INVALID_INPUT")
+                        break
+                if valid_files:
+                    tb = 0
+                    for fn, fcontent in files.items():
+                        b = fcontent.encode('utf-8')
+                        inv.append({"name": fn, "bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()})
+                    inv.sort(key=lambda x: x["name"].encode('utf-8'))
+                    for x in inv: tb += x["bytes"]
+                    inv_json = json.dumps([{"name": x["name"], "bytes": x["bytes"], "sha256": x["sha256"]} for x in inv], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                    pd = hashlib.sha256(inv_json).hexdigest()
+                    
             status = "frozen"
             ureason = c.get("unsupportedReason")
             
             if "unsupportedReason" in c and type(ureason) is str:
-                if ureason in aur: status = "unsupported"
+                if type(aur) is list and ureason in aur: status = "unsupported"
                 else: codes.add("UNALLOWED_UNSUPPORTED_REASON"); status = "invalid"
             else:
                 if c.get("loadable") is not True: codes.add("NOT_LOADABLE")
@@ -118,28 +111,37 @@ def quantize():
                 
             out_cands.append({
                 "name": cname, "status": status,
-                "inventory": inv if valid_files else [],
+                "inventory": inv if "INVALID_INPUT" not in codes else [],
                 "totalBytes": tb, "packageDigest": pd,
                 "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
             })
             
         out_cands.sort(key=lambda x: x["name"].encode('utf-8'))
         res = {"freezeId": fid, "candidates": out_cands}
-        quantize_state[fid] = {"request": req, "response": res}
+        
+        if type(fid) is str and fid:
+            quantize_state[fid] = {"request": req, "response": res}
+            
         return jsonify(res)
         
     elif phase == "select":
-        fid = req.get("freezeId")
         cands = req.get("candidates")
-        policy = req.get("policy")
-        lats = req.get("latencies")
         rows = req.get("rows")
+        policy = req.get("policy")
         
+        # ONLY return 400 for these specific structural missing fields
         if type(cands) is not list or type(rows) is not list or type(policy) is not dict:
             return jsonify({"error": "INVALID_INPUT"}), 400
             
+        fid = req.get("freezeId")
+        lats = req.get("latencies")
+        
         is_policy_valid = True
-        mb, af, rs, ml, co = policy.get("maxBytes"), policy.get("aggregateFloor"), policy.get("requiredSlices"), policy.get("maxLatencyMs"), policy.get("candidateOrder")
+        mb = policy.get("maxBytes")
+        af = policy.get("aggregateFloor")
+        rs = policy.get("requiredSlices")
+        ml = policy.get("maxLatencyMs")
+        co = policy.get("candidateOrder")
         
         if not (is_safe_int(mb) and mb >= 0 and is_finite_num(af) and 0 <= af <= 1 and type(rs) is dict and is_finite_num(ml) and ml >= 0 and type(co) is list):
             is_policy_valid = False
@@ -153,7 +155,7 @@ def quantize():
         cand_names = [c.get("name") for c in cands if type(c) is dict and type(c.get("name")) is str]
         if is_policy_valid and set(cand_names) != set(co): is_policy_valid = False
             
-        is_frozen = fid in quantize_state
+        is_frozen = type(fid) is str and fid in quantize_state
         stored_cands = quantize_state[fid]["response"]["candidates"] if is_frozen else []
         stored_cands_map = {c["name"]: c for c in stored_cands}
         
@@ -195,10 +197,12 @@ def quantize():
                 if pval not in [0, 1] or r.get("label") not in [0, 1]: preds_valid = False; break
                     
             agg = None
-            sl_acc = {}
+            sl_acc = None
             
-            if not preds_valid: codes.add("INVALID_PREDICTIONS")
+            if not preds_valid:
+                codes.add("INVALID_PREDICTIONS")
             else:
+                sl_acc = {}
                 if rows:
                     agg = round(sum(1 for r in rows if r.get("label") == r["predictions"].get(cname)) / len(rows), 12)
                     smets = {}
@@ -223,9 +227,11 @@ def quantize():
                             
             is_admitted = not codes and is_frozen and stored_cands_map.get(cname, {}).get("status") == "frozen"
             
+            valid_tb = is_safe_int(c.get("totalBytes")) and "INVALID_MANIFEST" not in codes
+
             res_obj = {
-                "name": cname, "aggregate": agg, "slices": sl_acc if preds_valid else {},
-                "totalBytes": c.get("totalBytes") if is_safe_int(c.get("totalBytes")) else None,
+                "name": cname, "aggregate": agg, "slices": sl_acc,
+                "totalBytes": c.get("totalBytes") if valid_tb else None,
                 "latencyMs": lat if valid_lat else None, "admitted": is_admitted,
                 "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
             }
@@ -247,7 +253,7 @@ def quantize():
         })
 
 # -----------------------------------------
-# PREVIOUS ENDPOINTS (DO NOT REMOVE)
+# PREVIOUS ROUTES (DO NOT REMOVE)
 # -----------------------------------------
 @app.route('/adapt', methods=['POST'], strict_slashes=False)
 def adapt():
